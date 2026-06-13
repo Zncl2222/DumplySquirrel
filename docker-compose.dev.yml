@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DEV_DB_NAME:-dumply_squirrel_dev}
+      POSTGRES_USER: dumply
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?required}
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dumply -d ${DEV_DB_NAME:-dumply_squirrel_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "${DEV_POSTGRES_PORT:-5432}:5432"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    restart: "no"
+    command: cargo run
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://dumply:${DB_PASSWORD:?required}@postgres:5432/${DEV_DB_NAME:-dumply_squirrel_dev}
+      JWT_SECRET: ${JWT_SECRET:?required}
+      DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:?required}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?required}
+      JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:-28800}
+      MAX_CONCURRENT_BACKUPS: ${MAX_CONCURRENT_BACKUPS:-2}
+      CORS_ALLOWED_ORIGIN: ${DEV_CORS_ALLOWED_ORIGIN:-http://localhost:5173}
+      BACKUP_DIR: /backups
+      BIND_ADDR: 0.0.0.0:${DEV_BACKEND_PORT:-8000}
+      RUST_LOG: ${DEV_RUST_LOG:-debug}
+      CARGO_TERM_COLOR: always
+    ports:
+      - "${DEV_BACKEND_PORT:-8000}:${DEV_BACKEND_PORT:-8000}"
+    volumes:
+      - ./backend:/app
+      - backup_data:/backups
+      - cargo_target:/app/target
+      - cargo_registry:/usr/local/cargo/registry
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    restart: "no"
+    command: ./scripts/dev-entrypoint.sh
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE_URL: ${DEV_FRONTEND_API_BASE_URL:-/api}
+      VITE_DEV_PROXY_TARGET: ${DEV_FRONTEND_PROXY_TARGET:-http://backend:8000}
+      CHOKIDAR_USEPOLLING: ${DEV_CHOKIDAR_USEPOLLING:-true}
+      DEV_FRONTEND_PORT: ${DEV_FRONTEND_PORT:-5173}
+    ports:
+      - "${DEV_FRONTEND_PORT:-5173}:${DEV_FRONTEND_PORT:-5173}"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+
+volumes:
+  pgdata_dev:
+    name: dumplysquirrel_pgdata_dev
+  backup_data:
+  cargo_target:
+  cargo_registry:
+  frontend_node_modules:

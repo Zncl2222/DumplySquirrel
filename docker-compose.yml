@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dumply_squirrel
+      POSTGRES_USER: dumply
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dumply -d dumply_squirrel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://dumply:${DB_PASSWORD:?required}@postgres:5432/dumply_squirrel
+      JWT_SECRET: ${JWT_SECRET:?required}
+      DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:?required}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?required}
+      JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:-28800}
+      MAX_CONCURRENT_BACKUPS: ${MAX_CONCURRENT_BACKUPS:-2}
+      CORS_ALLOWED_ORIGIN: ${CORS_ALLOWED_ORIGIN:-}
+      BACKUP_DIR: /backups
+      BIND_ADDR: 0.0.0.0:3000
+      RUST_LOG: ${RUST_LOG:-info}
+    expose:
+      - "3000"
+    volumes:
+      - backup_data:/backups
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      NGINX_PORT: ${HTTP_PORT:-80}
+      NGINX_HTTPS_PORT: ${HTTPS_PORT:-443}
+      SERVER_NAME: ${SERVER_NAME:-_}
+      ENABLE_TLS: ${ENABLE_TLS:-false}
+      TLS_CERT_FILE: /etc/nginx/certs/fullchain.pem
+      TLS_KEY_FILE: /etc/nginx/certs/privkey.pem
+    ports:
+      - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
+      - "${HTTPS_PORT:-443}:${HTTPS_PORT:-443}"
+    volumes:
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+
+volumes:
+  pgdata:
+  backup_data:
