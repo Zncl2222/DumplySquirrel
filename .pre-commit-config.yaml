@@ -1,0 +1,27 @@
+exclude: ^(frontend/(node_modules|dist)/|backend/target/|.*\.tsbuildinfo$)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(frontend/(node_modules|dist)/|backend/target/)
+      - id: end-of-file-fixer
+        exclude: ^(frontend/(node_modules|dist)/|backend/target/)
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-json
+        exclude: ^frontend/(node_modules|dist)/
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: bash -c 'cd backend && cargo fmt --all -- --check'
+        language: system
+        pass_filenames: false
+        files: ^backend/.*\.rs$

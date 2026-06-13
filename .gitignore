@@ -1,0 +1,10 @@
+.env
+target/
+backend/target/
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+backups/
+backups-dev/
+certs/
