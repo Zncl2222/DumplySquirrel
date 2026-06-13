@@ -213,6 +213,77 @@ async function responseError(response: Response) {
   }
 }
 
+const WEEKDAY_NAMES = ['日', '一', '二', '三', '四', '五', '六'];
+
+function expandRange(field: string): string[] {
+  const result: string[] = [];
+  for (const part of field.split(',')) {
+    const range = part.split('-');
+    if (range.length === 2) {
+      const start = parseInt(range[0], 10);
+      const end = parseInt(range[1], 10);
+      for (let i = start; i <= end; i++) result.push(String(i));
+    } else {
+      result.push(part);
+    }
+  }
+  return result;
+}
+
+export function cronToHuman(expr: string | null | undefined): string {
+  if (!expr) return '';
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 6) return expr;
+  const [sec, min, hour, day, month, weekday] = parts;
+
+  const secondOk = sec === '0' || sec === '*';
+  const minAll = min === '*';
+  const hourAll = hour === '*';
+  const dayAll = day === '*';
+  const monthAll = month === '*';
+  const weekdayAll = weekday === '*';
+
+  const minInterval = min.startsWith('*/') ? min.slice(2) : null;
+  const hourInterval = hour.startsWith('*/') ? hour.slice(2) : null;
+
+  const fmt = (n: string) => n.padStart(2, '0');
+  const isPlainNumber = (value: string) => /^\d+$/.test(value);
+
+  if (!secondOk) return expr;
+
+  // Every N minutes
+  if (minInterval && hourAll && dayAll && monthAll && weekdayAll) {
+    return `每 ${minInterval} 分鐘`;
+  }
+  // Every N hours
+  if (isPlainNumber(min) && hourInterval && dayAll && monthAll && weekdayAll) {
+    return `每 ${hourInterval} 小時的 ${fmt(min)} 分`;
+  }
+  // Specific minute every hour
+  if (isPlainNumber(min) && hourAll && dayAll && monthAll && weekdayAll) {
+    return `每小時 ${fmt(min)} 分`;
+  }
+  // Daily: specific hour + minute
+  if (isPlainNumber(min) && isPlainNumber(hour) && dayAll && monthAll && weekdayAll) {
+    return `每天 ${fmt(hour)}:${fmt(min)}`;
+  }
+  // Weekly: specific weekday(s)
+  if (isPlainNumber(min) && isPlainNumber(hour) && !weekdayAll && dayAll && monthAll) {
+    const days = expandRange(weekday).map(d => WEEKDAY_NAMES[parseInt(d, 10)] ?? d);
+    return `每週${days.join('、')} ${fmt(hour)}:${fmt(min)}`;
+  }
+  // Monthly: specific day of month
+  if (isPlainNumber(min) && isPlainNumber(hour) && !dayAll && monthAll && weekdayAll) {
+    return `每月 ${day} 日 ${fmt(hour)}:${fmt(min)}`;
+  }
+  // Yearly: specific month + day
+  if (isPlainNumber(min) && isPlainNumber(hour) && !dayAll && !monthAll && weekdayAll) {
+    return `每年 ${month} 月 ${day} 日 ${fmt(hour)}:${fmt(min)}`;
+  }
+
+  return expr;
+}
+
 export function formatBytes(value: number | null | undefined) {
   if (!value) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];

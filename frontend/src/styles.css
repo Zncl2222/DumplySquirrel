@@ -40,6 +40,14 @@ button:disabled {
   opacity: 0.65;
 }
 
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 3px solid #8aa97f;
+  outline-offset: 2px;
+}
+
 input,
 select {
   width: 100%;
@@ -209,6 +217,31 @@ nav button:hover,
   grid-template-columns: 1fr 1fr;
 }
 
+.schedule-summary {
+  border: 1px solid #d9e4d2;
+  border-radius: 18px;
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.9rem;
+}
+
+.schedule-summary span,
+.schedule-preview span {
+  color: #61705c;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.schedule-summary strong,
+.schedule-preview strong {
+  color: #172016;
+  font-size: 1rem;
+}
+
+.schedule-summary button {
+  justify-self: start;
+}
+
 .check {
   align-items: center;
   display: flex;
@@ -235,6 +268,111 @@ nav button:hover,
 .config-card p {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.schedule-code {
+  color: #778574;
+  font-size: 0.85rem;
+}
+
+.schedule-code summary {
+  cursor: pointer;
+}
+
+.schedule-code code {
+  display: block;
+  margin-top: 0.35rem;
+  overflow-wrap: anywhere;
+}
+
+.schedule-dialog {
+  background: #fbfdf8;
+  border: 0;
+  border-radius: 28px;
+  box-shadow: 0 24px 70px rgba(45, 72, 37, 0.22);
+  color: #172016;
+  max-width: 760px;
+  padding: 0;
+  width: min(760px, calc(100% - 2rem));
+}
+
+.schedule-dialog::backdrop {
+  background: rgba(16, 24, 14, 0.55);
+}
+
+.schedule-form {
+  display: grid;
+  gap: 1rem;
+  padding: 1.2rem;
+}
+
+.modal-heading,
+.modal-actions {
+  align-items: start;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.modal-heading h2 {
+  margin: 0;
+}
+
+.weekday-grid,
+.time-fields {
+  border: 1px solid #d9e4d2;
+  border-radius: 18px;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.85rem;
+}
+
+.weekday-grid {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.time-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.time-fields legend,
+.weekday-grid legend {
+  color: #61705c;
+  font-size: 0.82rem;
+  font-weight: 800;
+  padding: 0 0.3rem;
+}
+
+.weekday-grid .check {
+  border: 1px solid #d9e4d2;
+  border-radius: 999px;
+  gap: 0.35rem;
+  padding: 0.42rem 0.65rem;
+}
+
+.schedule-preview {
+  background: #eef3e8;
+  border: 1px solid #d9e4d2;
+  border-radius: 18px;
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.85rem;
+}
+
+.schedule-preview code {
+  color: #61705c;
+  overflow-wrap: anywhere;
+}
+
+.modal-actions {
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.confirm-dialog {
+  max-width: 520px;
 }
 
 .actions,
@@ -360,14 +498,17 @@ nav button:hover,
   }
 
   .topbar,
-  .sidebar-footer {
+  .sidebar-footer,
+  .modal-heading,
+  .modal-actions {
     align-items: stretch;
     flex-direction: column;
     gap: 0.75rem;
   }
 
   .grid,
-  .form-row {
+  .form-row,
+  .time-fields {
     grid-template-columns: 1fr;
   }
 }

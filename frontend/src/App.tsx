@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, useEffect, useRef, useState } from 'react';
 import {
   ApiClient,
   BackupConfig,
@@ -6,6 +6,7 @@ import {
   ConfigPayload,
   DashboardStats,
   User,
+  cronToHuman,
   formatBytes,
 } from './api';
 
@@ -34,6 +35,121 @@ const emptyConfigForm: ConfigFormState = {
   max_backups: '',
   is_enabled: true,
 };
+
+type ScheduleMode = 'manual' | 'minute' | 'hour' | 'daily' | 'weekly' | 'monthly' | 'yearly' | 'custom';
+
+type ScheduleDraft = {
+  mode: ScheduleMode;
+  time: string;
+  minuteInterval: string;
+  hourInterval: string;
+  weekdays: string[];
+  monthDay: string;
+  month: string;
+  cron: string;
+};
+
+const weekdayOptions = [
+  { value: '0', label: '週日' },
+  { value: '1', label: '週一' },
+  { value: '2', label: '週二' },
+  { value: '3', label: '週三' },
+  { value: '4', label: '週四' },
+  { value: '5', label: '週五' },
+  { value: '6', label: '週六' },
+];
+
+const dayOptions = Array.from({ length: 31 }, (_, index) => String(index + 1));
+const hourOptions = Array.from({ length: 24 }, (_, index) => String(index));
+const minuteOptions = Array.from({ length: 60 }, (_, index) => String(index));
+const monthOptions = Array.from({ length: 12 }, (_, index) => String(index + 1));
+const intervalOptions = ['5', '10', '15', '30'];
+const hourIntervalOptions = ['1', '2', '3', '4', '6', '8', '12'];
+
+const defaultScheduleDraft: ScheduleDraft = {
+  mode: 'daily',
+  time: '02:00',
+  minuteInterval: '30',
+  hourInterval: '2',
+  weekdays: ['1'],
+  monthDay: '1',
+  month: '1',
+  cron: '0 0 2 * * *',
+};
+
+function expandCronField(field: string) {
+  return field.split(',').flatMap((part) => {
+    const [start, end] = part.split('-').map((value) => Number(value));
+    if (Number.isInteger(start) && Number.isInteger(end) && start <= end) {
+      return Array.from({ length: end - start + 1 }, (_, index) => String(start + index));
+    }
+    return part;
+  });
+}
+
+function timeFromCron(hour: string, minute: string) {
+  return `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}`;
+}
+
+function timeParts(time: string) {
+  const [hour = '0', minute = '0'] = time.split(':');
+  return { hour: String(Number(hour)), minute: String(Number(minute)) };
+}
+
+function updateTimePart(time: string, part: 'hour' | 'minute', value: string) {
+  const current = timeParts(time);
+  const next = { ...current, [part]: value };
+  return timeFromCron(next.hour, next.minute);
+}
+
+function scheduleDraftFromCron(schedule: string): ScheduleDraft {
+  if (!schedule) return { ...defaultScheduleDraft, mode: 'manual', cron: '' };
+
+  const parts = schedule.trim().split(/\s+/);
+  if (parts.length !== 6) return { ...defaultScheduleDraft, mode: 'custom', cron: schedule };
+
+  const [sec, min, hour, day, month, weekday] = parts;
+  const base = { ...defaultScheduleDraft, cron: schedule };
+  const isNumber = (value: string) => /^\d+$/.test(value);
+
+  if (sec !== '0' && sec !== '*') return { ...base, mode: 'custom' };
+  if (min.startsWith('*/') && hour === '*' && day === '*' && month === '*' && weekday === '*') {
+    return { ...base, mode: 'minute', minuteInterval: min.slice(2) };
+  }
+  if (isNumber(min) && hour.startsWith('*/') && day === '*' && month === '*' && weekday === '*') {
+    return { ...base, mode: 'hour', time: timeFromCron('0', min), hourInterval: hour.slice(2) };
+  }
+  if (isNumber(min) && isNumber(hour) && day === '*' && month === '*' && weekday === '*') {
+    return { ...base, mode: 'daily', time: timeFromCron(hour, min) };
+  }
+  if (isNumber(min) && isNumber(hour) && day === '*' && month === '*' && weekday !== '*') {
+    return { ...base, mode: 'weekly', time: timeFromCron(hour, min), weekdays: expandCronField(weekday) };
+  }
+  if (isNumber(min) && isNumber(hour) && day !== '*' && month === '*' && weekday === '*') {
+    return { ...base, mode: 'monthly', time: timeFromCron(hour, min), monthDay: day };
+  }
+  if (isNumber(min) && isNumber(hour) && day !== '*' && month !== '*' && weekday === '*') {
+    return { ...base, mode: 'yearly', time: timeFromCron(hour, min), monthDay: day, month };
+  }
+
+  return { ...base, mode: 'custom' };
+}
+
+function cronFromScheduleDraft(draft: ScheduleDraft) {
+  const { hour, minute } = timeParts(draft.time);
+  if (draft.mode === 'manual') return '';
+  if (draft.mode === 'minute') return `0 */${draft.minuteInterval} * * * *`;
+  if (draft.mode === 'hour') return `0 ${minute} */${draft.hourInterval} * * *`;
+  if (draft.mode === 'daily') return `0 ${minute} ${hour} * * *`;
+  if (draft.mode === 'weekly') return `0 ${minute} ${hour} * * ${draft.weekdays.join(',') || '1'}`;
+  if (draft.mode === 'monthly') return `0 ${minute} ${hour} ${draft.monthDay} * *`;
+  if (draft.mode === 'yearly') return `0 ${minute} ${hour} ${draft.monthDay} ${draft.month} *`;
+  return draft.cron.trim();
+}
+
+function scheduleSummary(schedule: string) {
+  return schedule ? `${cronToHuman(schedule)} 開始` : '手動（不自動備份）';
+}
 
 export function App() {
   const [token, setToken] = useState(() => localStorage.getItem('dumply_token'));
@@ -240,6 +356,8 @@ function dbVersionOptions(dbType: 'postgres' | 'mysql') {
 function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs: BackupConfig[]; refresh: () => Promise<void>; setError: (error: string | null) => void }) {
   const [form, setForm] = useState(emptyConfigForm);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -284,6 +402,17 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
     });
   }
 
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    try {
+      await api.deleteConfig(deleteTarget.id);
+      setDeleteTarget(null);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '刪除設定失敗');
+    }
+  }
+
   return (
     <section className="two-column">
       <form className="panel form" onSubmit={submit}>
@@ -294,7 +423,12 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
         <label>Dump 版本<select value={form.db_version} onChange={(event) => setForm({ ...form, db_version: event.target.value })}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
         {form.db_type === 'mysql' && <p className="muted">MySQL 目前使用系統 mysqldump；版本選項只作為設定標示用途。</p>}
         <label>DB URL<input required placeholder="postgres://user:pass@host:5432/db" value={form.db_url} onChange={(event) => setForm({ ...form, db_url: event.target.value })} /></label>
-        <label>Cron<input placeholder="0 0 2 * * *" value={form.cron_schedule} onChange={(event) => setForm({ ...form, cron_schedule: event.target.value })} /></label>
+        <div className="schedule-summary">
+          <span>自動備份排程</span>
+          <strong>{scheduleSummary(form.cron_schedule)}</strong>
+          <p className="muted">{form.cron_schedule ? '已設定週期性自動備份。' : '不會自動執行，只能手動點「立即備份」。'}</p>
+          <button type="button" onClick={() => setScheduleDialogOpen(true)}>設定排程</button>
+        </div>
         <div className="form-row">
           <label>保留天數<input type="number" min="1" value={form.retention_days} onChange={(event) => setForm({ ...form, retention_days: Number(event.target.value) })} /></label>
           <label>Timeout 秒<input type="number" min="1" value={form.timeout_seconds} onChange={(event) => setForm({ ...form, timeout_seconds: Number(event.target.value) })} /></label>
@@ -304,6 +438,20 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
         <button>{editingId ? '更新設定' : '建立設定'}</button>
         {editingId && <button type="button" className="ghost" onClick={() => { setEditingId(null); setForm(emptyConfigForm); }}>取消編輯</button>}
       </form>
+      <ScheduleModal
+        open={scheduleDialogOpen}
+        value={form.cron_schedule}
+        onApply={(schedule) => {
+          setForm({ ...form, cron_schedule: schedule });
+          setScheduleDialogOpen(false);
+        }}
+        onClose={() => setScheduleDialogOpen(false)}
+      />
+      <DeleteConfigDialog
+        config={deleteTarget}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={confirmDelete}
+      />
 
       <div className="panel">
         <h2>備份設定</h2>
@@ -312,19 +460,143 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
             <article className="config-card" key={config.id}>
               <div><h3>{config.name}</h3><p>{config.db_url_masked}</p></div>
               <StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} />
-              <p>Cron: {config.cron_schedule || '手動'}</p>
+              <p><strong>自動備份:</strong> {scheduleSummary(config.cron_schedule ?? '')}</p>
+              {config.cron_schedule && <details className="schedule-code"><summary>查看排程代碼</summary><code>{config.cron_schedule}</code></details>}
               <p>Dump 版本: {config.db_version ?? 'Auto'}</p>
               <div className="actions">
                 <button onClick={() => api.triggerConfig(config.id).then(refresh).catch((err) => setError(err.message))}>立即備份</button>
                 <button className="ghost" onClick={() => api.toggleConfig(config.id, !config.is_enabled).then(refresh).catch((err) => setError(err.message))}>{config.is_enabled ? '停用' : '啟用'}</button>
                 <button className="ghost" onClick={() => edit(config)}>編輯</button>
-                <button className="danger" onClick={() => api.deleteConfig(config.id).then(refresh).catch((err) => setError(err.message))}>刪除</button>
+                <button className="danger" onClick={() => setDeleteTarget(config)}>刪除</button>
               </div>
             </article>
           ))}
         </div>
       </div>
     </section>
+  );
+}
+
+function ScheduleModal({ open, value, onApply, onClose }: { open: boolean; value: string; onApply: (schedule: string) => void; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [draft, setDraft] = useState(() => scheduleDraftFromCron(value));
+  const cron = cronFromScheduleDraft(draft);
+  const translated = cron ? cronToHuman(cron) : '手動（不自動備份）';
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal();
+    if (!open && dialog.open) dialog.close();
+  }, [open]);
+
+  useEffect(() => {
+    if (open) setDraft(scheduleDraftFromCron(value));
+  }, [open, value]);
+
+  function updateMode(mode: ScheduleMode) {
+    setDraft((current) => ({ ...current, mode, cron: mode === 'custom' ? (cron || '0 0 2 * * *') : current.cron }));
+  }
+
+  function toggleWeekday(day: string) {
+    setDraft((current) => {
+      if (current.weekdays.includes(day)) {
+        const weekdays = current.weekdays.filter((value) => value !== day);
+        return { ...current, weekdays: weekdays.length > 0 ? weekdays : current.weekdays };
+      }
+      return { ...current, weekdays: [...current.weekdays, day].sort() };
+    });
+  }
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onApply(cron);
+  }
+
+  return (
+    <dialog className="schedule-dialog" ref={dialogRef} onClose={onClose} aria-labelledby="schedule-dialog-title">
+      <form className="schedule-form" onSubmit={submit}>
+        <div className="modal-heading">
+          <div>
+            <h2 id="schedule-dialog-title">設定自動備份排程</h2>
+            <p className="muted">選擇週期與時間，或切到自訂 cron。下方會即時顯示實際執行時間。</p>
+          </div>
+          <button type="button" className="ghost" onClick={onClose}>關閉</button>
+        </div>
+
+        <label>排程類型<select value={draft.mode} onChange={(event) => updateMode(event.target.value as ScheduleMode)}>
+          <option value="manual">手動（不自動備份）</option>
+          <option value="minute">每幾分鐘</option>
+          <option value="hour">每幾小時</option>
+          <option value="daily">每天</option>
+          <option value="weekly">每週</option>
+          <option value="monthly">每月</option>
+          <option value="yearly">每年</option>
+          <option value="custom">手動輸入 cron</option>
+        </select></label>
+
+        {draft.mode === 'minute' && <label>每幾分鐘執行<select value={draft.minuteInterval} onChange={(event) => setDraft({ ...draft, minuteInterval: event.target.value })}>{intervalOptions.map((option) => <option key={option} value={option}>每 {option} 分鐘</option>)}</select></label>}
+        {draft.mode === 'hour' && <div className="form-row"><label>每幾小時執行<select value={draft.hourInterval} onChange={(event) => setDraft({ ...draft, hourInterval: event.target.value })}>{hourIntervalOptions.map((option) => <option key={option} value={option}>每 {option} 小時</option>)}</select></label><TimeFields time={draft.time} label="從每小時幾分開始" onChange={(time) => setDraft({ ...draft, time })} minuteOnly /></div>}
+        {['daily', 'weekly', 'monthly', 'yearly'].includes(draft.mode) && <TimeFields time={draft.time} label="開始時間" onChange={(time) => setDraft({ ...draft, time })} />}
+        {draft.mode === 'weekly' && <fieldset className="weekday-grid"><legend>星期幾執行</legend>{weekdayOptions.map((option) => <label key={option.value} className="check"><input type="checkbox" checked={draft.weekdays.includes(option.value)} onChange={() => toggleWeekday(option.value)} />{option.label}</label>)}</fieldset>}
+        {draft.mode === 'monthly' && <label>每月幾號執行<select value={draft.monthDay} onChange={(event) => setDraft({ ...draft, monthDay: event.target.value })}>{dayOptions.map((option) => <option key={option} value={option}>{option} 日</option>)}</select></label>}
+        {draft.mode === 'yearly' && <div className="form-row"><label>每年幾月執行<select value={draft.month} onChange={(event) => setDraft({ ...draft, month: event.target.value })}>{monthOptions.map((option) => <option key={option} value={option}>{option} 月</option>)}</select></label><label>幾號執行<select value={draft.monthDay} onChange={(event) => setDraft({ ...draft, monthDay: event.target.value })}>{dayOptions.map((option) => <option key={option} value={option}>{option} 日</option>)}</select></label></div>}
+        {draft.mode === 'custom' && <label>手動輸入 cron<input aria-describedby="schedule-preview" value={draft.cron} onChange={(event) => setDraft({ ...draft, cron: event.target.value })} /></label>}
+
+        <div className="schedule-preview" id="schedule-preview" aria-live="polite">
+          <span>排程預覽</span>
+          <strong>{cron ? `${translated} 開始` : translated}</strong>
+          {cron && <code>{cron}</code>}
+        </div>
+
+        <div className="modal-actions">
+          <button type="button" className="ghost" onClick={onClose}>取消</button>
+          <button type="submit">套用排程</button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+function TimeFields({ time, label, minuteOnly = false, onChange }: { time: string; label: string; minuteOnly?: boolean; onChange: (time: string) => void }) {
+  const { hour, minute } = timeParts(time);
+  return (
+    <fieldset className="time-fields">
+      <legend>{label}</legend>
+      {!minuteOnly && <label>小時<select value={hour} onChange={(event) => onChange(updateTimePart(time, 'hour', event.target.value))}>{hourOptions.map((option) => <option key={option} value={option}>{option.padStart(2, '0')} 時</option>)}</select></label>}
+      <label>分鐘<select value={minute} onChange={(event) => onChange(updateTimePart(time, 'minute', event.target.value))}>{minuteOptions.map((option) => <option key={option} value={option}>{option.padStart(2, '0')} 分</option>)}</select></label>
+    </fieldset>
+  );
+}
+
+function DeleteConfigDialog({ config, onCancel, onConfirm }: { config: BackupConfig | null; onCancel: () => void; onConfirm: () => Promise<void> }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (config && !dialog.open) dialog.showModal();
+    if (!config && dialog.open) dialog.close();
+  }, [config]);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await onConfirm();
+  }
+
+  return (
+    <dialog className="schedule-dialog confirm-dialog" ref={dialogRef} onClose={onCancel} aria-labelledby="delete-config-title">
+      <form className="schedule-form" onSubmit={submit}>
+        <div>
+          <h2 id="delete-config-title">確定要刪除備份設定？</h2>
+          <p className="muted">這會刪除「{config?.name ?? ''}」的設定，之後不會再依照這個排程自動備份。</p>
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="ghost" onClick={onCancel}>取消</button>
+          <button type="submit" className="danger">確認刪除</button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 
