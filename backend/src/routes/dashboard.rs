@@ -1,7 +1,7 @@
 use axum::{extract::State, http::HeaderMap, routing::get, Json, Router};
 use serde_json::json;
 
-use crate::{error::AppResult, middleware::auth::authorize, AppState};
+use crate::{error::AppResult, AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/stats", get(stats))
@@ -11,7 +11,7 @@ async fn stats(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
 
     let total_configs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_configs")
         .fetch_one(&state.db)

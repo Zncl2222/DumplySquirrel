@@ -14,7 +14,6 @@ use uuid::Uuid;
 use crate::{
     db::models::BackupHistory,
     error::{AppError, AppResult},
-    middleware::auth::authorize,
     AppState,
 };
 
@@ -38,12 +37,13 @@ pub(super) async fn list_history(
     headers: HeaderMap,
     Query(query): Query<HistoryQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
+    let limit = per_page + 1;
 
-    let rows = sqlx::query_as::<_, BackupHistory>(
+    let mut rows = sqlx::query_as::<_, BackupHistory>(
         r#"
         SELECT id, config_id, status, file_name, file_size, file_path,
                error_message, started_at, completed_at, triggered_by
@@ -56,14 +56,18 @@ pub(super) async fn list_history(
     )
     .bind(query.config_id)
     .bind(query.status)
-    .bind(per_page)
+    .bind(limit)
     .bind(offset)
     .fetch_all(&state.db)
     .await?;
+    let has_next = rows.len() > per_page as usize;
+    if has_next {
+        rows.truncate(per_page as usize);
+    }
 
     Ok(Json(json!({
         "data": rows,
-        "pagination": { "page": page, "per_page": per_page }
+        "pagination": { "page": page, "per_page": per_page, "has_next": has_next }
     })))
 }
 
@@ -72,7 +76,7 @@ async fn get_history(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     let row = sqlx::query_as::<_, BackupHistory>(
         r#"
         SELECT id, config_id, status, file_name, file_size, file_path,
@@ -92,7 +96,7 @@ async fn download_history(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Response> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     let row = sqlx::query_as::<_, BackupHistory>(
         r#"
         SELECT id, config_id, status, file_name, file_size, file_path,
@@ -143,7 +147,7 @@ async fn download_history(
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/sql; charset=utf-8"),
+        HeaderValue::from_static("application/octet-stream"),
     );
     response.headers_mut().insert(
         header::CONTENT_LENGTH,

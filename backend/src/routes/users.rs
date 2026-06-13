@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{
     db::models::User,
     error::{AppError, AppResult},
-    middleware::auth::{authorize, require_admin},
+    middleware::auth::require_admin,
     AppState,
 };
 
@@ -33,7 +33,7 @@ pub(super) async fn list_users(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    let auth = authorize(&headers, &state.config)?;
+    let auth = state.auth.authorize(&headers, &state.config)?;
     require_admin(&auth)?;
 
     let users = sqlx::query_as::<_, User>(
@@ -50,7 +50,7 @@ pub(super) async fn create_user(
     headers: HeaderMap,
     Json(payload): Json<CreateUserRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let auth = authorize(&headers, &state.config)?;
+    let auth = state.auth.authorize(&headers, &state.config)?;
     require_admin(&auth)?;
     validate_password(&payload.password)?;
 
@@ -83,7 +83,7 @@ async fn delete_user(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let auth = authorize(&headers, &state.config)?;
+    let auth = state.auth.authorize(&headers, &state.config)?;
     require_admin(&auth)?;
     if auth.id == id {
         return Err(AppError::Validation("cannot delete current user".into()));

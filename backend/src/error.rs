@@ -13,6 +13,8 @@ pub enum AppError {
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    #[error("too many requests")]
+    TooManyRequests,
     #[error("not found")]
     NotFound,
     #[error("backup file is missing")]
@@ -44,6 +46,11 @@ impl IntoResponse for AppError {
         let (status, code, message) = match &self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", self.to_string()),
             Self::Forbidden => (StatusCode::FORBIDDEN, "FORBIDDEN", self.to_string()),
+            Self::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOO_MANY_REQUESTS",
+                self.to_string(),
+            ),
             Self::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", self.to_string()),
             Self::FileMissing => (StatusCode::NOT_FOUND, "FILE_MISSING", self.to_string()),
             Self::Validation(_) => (
@@ -60,7 +67,7 @@ impl IntoResponse for AppError {
             Self::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
-                self.to_string(),
+                "internal error".to_string(),
             ),
         };
 

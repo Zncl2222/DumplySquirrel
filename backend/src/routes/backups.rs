@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::{
     db::models::BackupConfig,
     error::{AppError, AppResult},
-    middleware::auth::authorize,
     services::{
         backup_executor::{self, BackupTrigger},
         crypto, scheduler,
@@ -66,7 +65,7 @@ pub(super) async fn list_configs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     let configs = sqlx::query_as::<_, BackupConfig>(
         r#"
         SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
@@ -91,17 +90,13 @@ pub(super) async fn create_config(
     headers: HeaderMap,
     Json(payload): Json<BackupConfigRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let auth = authorize(&headers, &state.config)?;
+    let auth = state.auth.authorize(&headers, &state.config)?;
     validate_payload(&payload)?;
 
     let mut db_version = normalize_db_version(payload.db_version);
     if db_version.is_none() {
-        let detected = backup_executor::detect_db_version(
-            &payload.db_type,
-            &payload.db_url,
-            30,
-        )
-        .await?;
+        let detected =
+            backup_executor::detect_db_version(&payload.db_type, &payload.db_url, 30).await?;
         db_version = Some(detected);
     }
 
@@ -147,17 +142,13 @@ async fn update_config(
     Path(id): Path<Uuid>,
     Json(payload): Json<BackupConfigRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     validate_payload(&payload)?;
 
     let mut db_version = normalize_db_version(payload.db_version);
     if db_version.is_none() {
-        let detected = backup_executor::detect_db_version(
-            &payload.db_type,
-            &payload.db_url,
-            30,
-        )
-        .await?;
+        let detected =
+            backup_executor::detect_db_version(&payload.db_type, &payload.db_url, 30).await?;
         db_version = Some(detected);
     }
 
@@ -210,7 +201,7 @@ async fn delete_config(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     let running: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM backup_history WHERE config_id = $1 AND status = 'running' LIMIT 1",
     )
@@ -248,7 +239,7 @@ async fn toggle_config(
     Path(id): Path<Uuid>,
     Json(payload): Json<ToggleRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     let config = sqlx::query_as::<_, BackupConfig>(
         r#"
         UPDATE backup_configs SET is_enabled = $2, updated_at = now()
@@ -273,7 +264,7 @@ async fn trigger_config(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    authorize(&headers, &state.config)?;
+    state.auth.authorize(&headers, &state.config)?;
     let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM backup_configs WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)

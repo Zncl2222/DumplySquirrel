@@ -238,7 +238,8 @@ nav button:hover,
 }
 
 .actions,
-.panel-heading {
+.panel-heading,
+.pagination {
   align-items: center;
   display: flex;
   flex-wrap: wrap;
@@ -248,6 +249,11 @@ nav button:hover,
 .panel-heading {
   justify-content: space-between;
   margin-bottom: 1rem;
+}
+
+.pagination {
+  justify-content: flex-end;
+  margin-top: 1rem;
 }
 
 .danger {

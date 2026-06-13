@@ -43,6 +43,8 @@ export function App() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [configs, setConfigs] = useState<BackupConfig[]>([]);
   const [history, setHistory] = useState<BackupHistory[]>([]);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyHasNext, setHistoryHasNext] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -66,13 +68,15 @@ export function App() {
         api.me(),
         api.stats(),
         api.configs(),
-        api.history(),
+        api.history({ page: historyPage, per_page: 20 }),
         api.users(),
       ]);
       setUser(me);
       setStats(dashboardStats);
       setConfigs(backupConfigs);
-      setHistory(backupHistory);
+      setHistory(backupHistory.data);
+      setHistoryPage(backupHistory.pagination.page);
+      setHistoryHasNext(backupHistory.pagination.has_next);
       setUsers(userList);
     } catch (err) {
       const message = err instanceof Error ? err.message : '載入失敗';
@@ -85,12 +89,35 @@ export function App() {
     }
   }
 
-  function logout() {
-    setToken(null);
-    setStats(null);
-    setConfigs([]);
-    setHistory([]);
-    setUsers([]);
+  async function logout() {
+    setLoading(true);
+    try {
+      await api.logout();
+    } catch {
+      // Local logout still needs to complete if the revocation request fails.
+    } finally {
+      setToken(null);
+      setStats(null);
+      setConfigs([]);
+      setHistory([]);
+      setUsers([]);
+      setLoading(false);
+    }
+  }
+
+  async function loadHistoryPage(page: number) {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await api.history({ page, per_page: 20 });
+      setHistory(response.data);
+      setHistoryPage(response.pagination.page);
+      setHistoryHasNext(response.pagination.has_next);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '載入歷史記錄失敗');
+    } finally {
+      setLoading(false);
+    }
   }
 
   if (!token || !user) {
@@ -127,7 +154,7 @@ export function App() {
         {error && <div className="alert">{error}</div>}
         {tab === 'dashboard' && <Dashboard stats={stats} configs={configs} history={history} />}
         {tab === 'configs' && <Configs api={api} configs={configs} refresh={refreshAll} setError={setError} />}
-        {tab === 'history' && <History api={api} history={history} configs={configs} refresh={refreshAll} setError={setError} />}
+        {tab === 'history' && <History api={api} history={history} configs={configs} page={historyPage} hasNext={historyHasNext} refresh={refreshAll} setError={setError} onPageChange={loadHistoryPage} />}
         {tab === 'users' && <Users api={api} users={users} refresh={refreshAll} setError={setError} currentUser={user} />}
       </main>
     </div>
@@ -261,7 +288,7 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
     <section className="two-column">
       <form className="panel form" onSubmit={submit}>
         <h2>{editingId ? '更新備份設定' : '新增備份設定'}</h2>
-        {editingId && <p className="muted">更新設定需要重新輸入完整 DB URL，API 不會回傳密碼。</p>}
+        {editingId && <p className="muted">更新設定需要重新輸入完整 DB URL，API 不會回傳完整連線字串。</p>}
         <label>名稱<input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
         <label>資料庫類型<select value={form.db_type} onChange={(event) => setForm({ ...form, db_type: event.target.value as 'postgres' | 'mysql', db_version: '' })}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
         <label>Dump 版本<select value={form.db_version} onChange={(event) => setForm({ ...form, db_version: event.target.value })}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
@@ -301,11 +328,16 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
   );
 }
 
-function History({ api, history, configs, refresh, setError }: { api: ApiClient; history: BackupHistory[]; configs: BackupConfig[]; refresh: () => Promise<void>; setError: (error: string | null) => void }) {
+function History({ api, history, configs, page, hasNext, refresh, setError, onPageChange }: { api: ApiClient; history: BackupHistory[]; configs: BackupConfig[]; page: number; hasNext: boolean; refresh: () => Promise<void>; setError: (error: string | null) => void; onPageChange: (page: number) => Promise<void> }) {
   return (
     <section className="panel">
       <div className="panel-heading"><h2>歷史記錄</h2><button onClick={refresh}>重新整理</button></div>
       <HistoryTable history={history} configs={configs} onDownload={(id) => api.downloadHistory(id).catch((err) => setError(err.message))} />
+      <div className="pagination">
+        <button className="ghost" disabled={page <= 1} onClick={() => void onPageChange(page - 1)}>上一頁</button>
+        <span>第 {page} 頁</span>
+        <button className="ghost" disabled={!hasNext} onClick={() => void onPageChange(page + 1)}>下一頁</button>
+      </div>
     </section>
   );
 }

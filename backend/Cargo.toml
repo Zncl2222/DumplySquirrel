@@ -22,7 +22,7 @@ thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-cron-scheduler = "0.13"
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "timeout", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"

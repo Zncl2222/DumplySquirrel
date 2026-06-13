@@ -28,7 +28,7 @@ pub async fn bootstrap_admin(pool: &PgPool, config: &AppConfig) -> anyhow::Resul
     }
 
     let password_hash = hash(&config.admin_password, DEFAULT_COST)?;
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO users (id, username, password_hash, role)
         VALUES ($1, $2, $3, 'admin')
@@ -38,7 +38,15 @@ pub async fn bootstrap_admin(pool: &PgPool, config: &AppConfig) -> anyhow::Resul
     .bind(&config.admin_username)
     .bind(password_hash)
     .execute(pool)
-    .await?;
+    .await;
+
+    if let Err(sqlx::Error::Database(err)) = &result {
+        if err.code().as_deref() == Some("23505") {
+            tracing::info!(username = %config.admin_username, "bootstrap admin already created by another instance");
+            return Ok(());
+        }
+    }
+    result?;
 
     tracing::info!(username = %config.admin_username, "bootstrap admin user created");
     Ok(())

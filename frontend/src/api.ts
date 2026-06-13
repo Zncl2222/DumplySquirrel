@@ -44,6 +44,10 @@ export type DashboardStats = {
 
 type ApiEnvelope<T> = { data: T };
 
+type HistoryEnvelope = ApiEnvelope<BackupHistory[]> & {
+  pagination: { page: number; per_page: number; has_next: boolean };
+};
+
 export type ConfigPayload = {
   name: string;
   db_type: 'postgres' | 'mysql';
@@ -54,6 +58,13 @@ export type ConfigPayload = {
   timeout_seconds?: number;
   max_backups?: number | null;
   is_enabled?: boolean;
+};
+
+export type HistoryQuery = {
+  page?: number;
+  per_page?: number;
+  config_id?: string;
+  status?: string;
 };
 
 export class ApiClient {
@@ -72,6 +83,10 @@ export class ApiClient {
 
   me() {
     return this.request<User>('/auth/me');
+  }
+
+  logout() {
+    return this.request<{ message: string }>('/auth/logout', { method: 'POST' });
   }
 
   stats() {
@@ -111,8 +126,15 @@ export class ApiClient {
     return this.request<BackupHistory>(`/backup-configs/${id}/trigger`, { method: 'POST' });
   }
 
-  history() {
-    return this.request<BackupHistory[]>('/backup-history');
+  history(query: HistoryQuery = {}) {
+    const search = new URLSearchParams();
+    Object.entries(query).forEach(([key, value]) => {
+      if (value !== undefined && value !== '') {
+        search.set(key, String(value));
+      }
+    });
+    const suffix = search.size > 0 ? `?${search.toString()}` : '';
+    return this.requestEnvelope<HistoryEnvelope>(`/backup-history${suffix}`);
   }
 
   users() {
@@ -152,6 +174,11 @@ export class ApiClient {
   }
 
   private async request<T>(path: string, init: RequestInit = {}) {
+    const envelope = await this.requestEnvelope<ApiEnvelope<T>>(path, init);
+    return envelope.data;
+  }
+
+  private async requestEnvelope<T>(path: string, init: RequestInit = {}) {
     const response = await fetch(`${API_BASE}${path}`, {
       ...init,
       headers: {
@@ -162,8 +189,7 @@ export class ApiClient {
     if (!response.ok) {
       throw new Error(await responseError(response));
     }
-    const envelope = (await response.json()) as ApiEnvelope<T>;
-    return envelope.data;
+    return (await response.json()) as T;
   }
 
   private headers(json: boolean) {
