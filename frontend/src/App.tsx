@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ApiClient,
   BackupConfig,
@@ -358,6 +358,52 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
   const [editingId, setEditingId] = useState<string | null>(null);
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
+  const [showPanel, setShowPanel] = useState(false);
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState<'all' | 'postgres' | 'mysql'>('all');
+  const panelFormRef = useRef<HTMLFormElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const filtered = useMemo(() => configs.filter((config) => {
+    if (typeFilter !== 'all' && config.db_type !== typeFilter) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      return (
+        config.name.toLowerCase().includes(q) ||
+        config.db_url_masked.toLowerCase().includes(q)
+      );
+    }
+    return true;
+  }), [configs, search, typeFilter]);
+
+  useEffect(() => {
+    if (!showPanel) return;
+    if (!panelRef.current) return;
+    const focusable = panelRef.current.querySelector<HTMLElement>('input, select, button, [tabindex]:not([tabindex="-1"])');
+    focusable?.focus();
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        closePanel();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const el = panelRef.current;
+      if (!el) return;
+      const focusables = el.querySelectorAll<HTMLElement>('input, select, button, [tabindex]:not([tabindex="-1"])');
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [showPanel]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -381,13 +427,20 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
       }
       setEditingId(null);
       setForm(emptyConfigForm);
+      setShowPanel(false);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : '儲存設定失敗');
     }
   }
 
-  function edit(config: BackupConfig) {
+  function openCreate() {
+    setEditingId(null);
+    setForm(emptyConfigForm);
+    setShowPanel(true);
+  }
+
+  function openEdit(config: BackupConfig) {
     setEditingId(config.id);
     setForm({
       name: config.name,
@@ -400,6 +453,13 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
       max_backups: config.max_backups?.toString() ?? '',
       is_enabled: config.is_enabled,
     });
+    setShowPanel(true);
+  }
+
+  function closePanel() {
+    setShowPanel(false);
+    setEditingId(null);
+    setForm(emptyConfigForm);
   }
 
   async function confirmDelete() {
@@ -414,30 +474,115 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
   }
 
   return (
-    <section className="two-column">
-      <form className="panel form" onSubmit={submit}>
-        <h2>{editingId ? '更新備份設定' : '新增備份設定'}</h2>
-        {editingId && <p className="muted">更新設定需要重新輸入完整 DB URL，API 不會回傳完整連線字串。</p>}
-        <label>名稱<input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
-        <label>資料庫類型<select value={form.db_type} onChange={(event) => setForm({ ...form, db_type: event.target.value as 'postgres' | 'mysql', db_version: '' })}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
-        <label>Dump 版本<select value={form.db_version} onChange={(event) => setForm({ ...form, db_version: event.target.value })}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-        {form.db_type === 'mysql' && <p className="muted">MySQL 目前使用系統 mysqldump；版本選項只作為設定標示用途。</p>}
-        <label>DB URL<input required placeholder="postgres://user:pass@host:5432/db" value={form.db_url} onChange={(event) => setForm({ ...form, db_url: event.target.value })} /></label>
-        <div className="schedule-summary">
-          <span>自動備份排程</span>
-          <strong>{scheduleSummary(form.cron_schedule)}</strong>
-          <p className="muted">{form.cron_schedule ? '已設定週期性自動備份。' : '不會自動執行，只能手動點「立即備份」。'}</p>
-          <button type="button" onClick={() => setScheduleDialogOpen(true)}>設定排程</button>
+    <section className="configs-page">
+      <div className="config-header">
+        <h2>備份設定</h2>
+        <p>管理你的資料庫備份任務。每個設定對應一個資料庫連線與排程。</p>
+      </div>
+
+      <div className="config-toolbar">
+        <div className="config-search">
+          <input placeholder="搜尋名稱或連線位址..." value={search} onChange={(e) => setSearch(e.target.value)} />
         </div>
-        <div className="form-row">
-          <label>保留天數<input type="number" min="1" value={form.retention_days} onChange={(event) => setForm({ ...form, retention_days: Number(event.target.value) })} /></label>
-          <label>Timeout 秒<input type="number" min="1" value={form.timeout_seconds} onChange={(event) => setForm({ ...form, timeout_seconds: Number(event.target.value) })} /></label>
+        <div className="config-filters">
+          <button className={`config-type-btn type-all ${typeFilter === 'all' ? 'active' : ''}`} onClick={() => setTypeFilter('all')}>全部</button>
+          <button className={`config-type-btn type-postgres ${typeFilter === 'postgres' ? 'active' : ''}`} onClick={() => setTypeFilter('postgres')}>PostgreSQL</button>
+          <button className={`config-type-btn type-mysql ${typeFilter === 'mysql' ? 'active' : ''}`} onClick={() => setTypeFilter('mysql')}>MySQL</button>
         </div>
-        <label>最多保留份數<input type="number" min="1" value={form.max_backups} onChange={(event) => setForm({ ...form, max_backups: event.target.value })} /></label>
-        <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(event) => setForm({ ...form, is_enabled: event.target.checked })} />啟用排程</label>
-        <button>{editingId ? '更新設定' : '建立設定'}</button>
-        {editingId && <button type="button" className="ghost" onClick={() => { setEditingId(null); setForm(emptyConfigForm); }}>取消編輯</button>}
-      </form>
+        <span className="config-count">{filtered.length} / {configs.length}</span>
+        <button onClick={openCreate}>新增資料庫</button>
+      </div>
+
+      {filtered.length > 0 ? (
+        <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+          <table className="config-table">
+            <thead>
+              <tr>
+                <th>名稱</th>
+                <th>類型</th>
+                <th>版本</th>
+                <th>排程</th>
+                <th>保留</th>
+                <th>狀態</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((config) => (
+                <tr key={config.id} className={`row-${config.db_type}`}>
+                  <td>
+                    <div className="config-name">{config.name}</div>
+                    <span className="config-url" title={config.db_url_masked}>{config.db_url_masked}</span>
+                  </td>
+                  <td>
+                    <span className={`db-type-badge ${config.db_type}`}>
+                      {config.db_type === 'postgres' ? 'PG' : 'MY'}
+                    </span>
+                  </td>
+                  <td className="config-retention">{config.db_version ?? 'Auto'}</td>
+                  <td className="config-schedule">
+                    {scheduleSummary(config.cron_schedule ?? '')}
+                    {config.cron_schedule && <code title={config.cron_schedule}>{config.cron_schedule}</code>}
+                  </td>
+                  <td className="config-retention">{config.retention_days} 天</td>
+                  <td><StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} /></td>
+                  <td>
+                    <div className="config-actions">
+                      <button className="ghost" onClick={() => api.triggerConfig(config.id).then(refresh).catch((err) => setError(err.message))}>備份</button>
+                      <button className="ghost" onClick={() => api.toggleConfig(config.id, !config.is_enabled).then(refresh).catch((err) => setError(err.message))}>{config.is_enabled ? '停用' : '啟用'}</button>
+                      <button className="ghost" onClick={() => openEdit(config)}>編輯</button>
+                      <button className="danger" onClick={() => setDeleteTarget(config)}>刪除</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="config-empty">
+          <h3>{search || typeFilter !== 'all' ? '找不到符合的設定' : '還沒有備份設定'}</h3>
+          <p>{search || typeFilter !== 'all' ? '嘗試調整搜尋條件或篩選器。' : '新增你的第一個資料庫備份任務，設定排程後系統會自動執行。'}</p>
+          {!search && typeFilter === 'all' && <button onClick={openCreate}>新增資料庫</button>}
+        </div>
+      )}
+
+      {showPanel && (
+        <>
+          <div className="config-overlay" onClick={closePanel} />
+          <div className="config-panel" ref={panelRef} role="dialog" aria-label={editingId ? '編輯備份設定' : '新增備份設定'}>
+            <div className="config-panel-header">
+              <h2>{editingId ? '編輯備份設定' : '新增備份設定'}</h2>
+              <button className="config-panel-close" onClick={closePanel} aria-label="關閉">✕</button>
+            </div>
+            <form ref={panelFormRef} className="config-panel-body form" onSubmit={submit}>
+              {editingId && <p className="panel-note">更新設定需要重新輸入完整 DB URL，API 不會回傳完整連線字串。</p>}
+              <label>名稱<input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+              <label>資料庫類型<select value={form.db_type} onChange={(e) => setForm({ ...form, db_type: e.target.value as 'postgres' | 'mysql', db_version: '' })}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
+              <label>Dump 版本<select value={form.db_version} onChange={(e) => setForm({ ...form, db_version: e.target.value })}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+              {form.db_type === 'mysql' && <p className="muted">MySQL 目前使用系統 mysqldump；版本選項只作為設定標示用途。</p>}
+              <label>DB URL<input required placeholder="postgres://user:pass@host:5432/db" value={form.db_url} onChange={(e) => setForm({ ...form, db_url: e.target.value })} /></label>
+              <div className="schedule-summary">
+                <span>自動備份排程</span>
+                <strong>{scheduleSummary(form.cron_schedule)}</strong>
+                <p className="muted">{form.cron_schedule ? '已設定週期性自動備份。' : '不會自動執行，只能手動點「立即備份」。'}</p>
+                <button type="button" onClick={() => setScheduleDialogOpen(true)}>設定排程</button>
+              </div>
+              <div className="form-row">
+                <label>保留天數<input type="number" min="1" value={form.retention_days} onChange={(e) => setForm({ ...form, retention_days: Number(e.target.value) })} /></label>
+                <label>Timeout 秒<input type="number" min="1" value={form.timeout_seconds} onChange={(e) => setForm({ ...form, timeout_seconds: Number(e.target.value) })} /></label>
+              </div>
+              <label>最多保留份數<input type="number" min="1" value={form.max_backups} onChange={(e) => setForm({ ...form, max_backups: e.target.value })} /></label>
+              <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(e) => setForm({ ...form, is_enabled: e.target.checked })} />啟用排程</label>
+            </form>
+            <div className="config-panel-footer">
+              <button className="ghost" onClick={closePanel}>取消</button>
+              <button onClick={() => panelFormRef.current?.requestSubmit()}>{editingId ? '更新設定' : '建立設定'}</button>
+            </div>
+          </div>
+        </>
+      )}
+
       <ScheduleModal
         open={scheduleDialogOpen}
         value={form.cron_schedule}
@@ -452,27 +597,6 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
         onCancel={() => setDeleteTarget(null)}
         onConfirm={confirmDelete}
       />
-
-      <div className="panel">
-        <h2>備份設定</h2>
-        <div className="cards">
-          {configs.map((config) => (
-            <article className="config-card" key={config.id}>
-              <div><h3>{config.name}</h3><p>{config.db_url_masked}</p></div>
-              <StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} />
-              <p><strong>自動備份:</strong> {scheduleSummary(config.cron_schedule ?? '')}</p>
-              {config.cron_schedule && <details className="schedule-code"><summary>查看排程代碼</summary><code>{config.cron_schedule}</code></details>}
-              <p>Dump 版本: {config.db_version ?? 'Auto'}</p>
-              <div className="actions">
-                <button onClick={() => api.triggerConfig(config.id).then(refresh).catch((err) => setError(err.message))}>立即備份</button>
-                <button className="ghost" onClick={() => api.toggleConfig(config.id, !config.is_enabled).then(refresh).catch((err) => setError(err.message))}>{config.is_enabled ? '停用' : '啟用'}</button>
-                <button className="ghost" onClick={() => edit(config)}>編輯</button>
-                <button className="danger" onClick={() => setDeleteTarget(config)}>刪除</button>
-              </div>
-            </article>
-          ))}
-        </div>
-      </div>
     </section>
   );
 }
