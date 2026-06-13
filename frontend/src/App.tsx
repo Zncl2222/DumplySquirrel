@@ -1,0 +1,379 @@
+import { FormEvent, useEffect, useState } from 'react';
+import {
+  ApiClient,
+  BackupConfig,
+  BackupHistory,
+  ConfigPayload,
+  DashboardStats,
+  User,
+  formatBytes,
+} from './api';
+
+type Tab = 'dashboard' | 'configs' | 'history' | 'users';
+
+type ConfigFormState = {
+  name: string;
+  db_type: 'postgres' | 'mysql';
+  db_version: string;
+  db_url: string;
+  cron_schedule: string;
+  retention_days: number;
+  timeout_seconds: number;
+  max_backups: string;
+  is_enabled: boolean;
+};
+
+const emptyConfigForm: ConfigFormState = {
+  name: '',
+  db_type: 'postgres',
+  db_version: '',
+  db_url: '',
+  cron_schedule: '',
+  retention_days: 30,
+  timeout_seconds: 3600,
+  max_backups: '',
+  is_enabled: true,
+};
+
+export function App() {
+  const [token, setToken] = useState(() => localStorage.getItem('dumply_token'));
+  const [api] = useState(() => new ApiClient(token));
+  const [user, setUser] = useState<User | null>(null);
+  const [tab, setTab] = useState<Tab>('dashboard');
+  const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [configs, setConfigs] = useState<BackupConfig[]>([]);
+  const [history, setHistory] = useState<BackupHistory[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    api.setToken(token);
+    if (token) {
+      localStorage.setItem('dumply_token', token);
+      void refreshAll();
+    } else {
+      localStorage.removeItem('dumply_token');
+      setUser(null);
+    }
+  }, [api, token]);
+
+  async function refreshAll() {
+    setLoading(true);
+    setError(null);
+    try {
+      const [me, dashboardStats, backupConfigs, backupHistory, userList] = await Promise.all([
+        api.me(),
+        api.stats(),
+        api.configs(),
+        api.history(),
+        api.users(),
+      ]);
+      setUser(me);
+      setStats(dashboardStats);
+      setConfigs(backupConfigs);
+      setHistory(backupHistory);
+      setUsers(userList);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '載入失敗';
+      setError(message);
+      if (message.includes('unauthorized')) {
+        setToken(null);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function logout() {
+    setToken(null);
+    setStats(null);
+    setConfigs([]);
+    setHistory([]);
+    setUsers([]);
+  }
+
+  if (!token || !user) {
+    return <LoginPage api={api} onLogin={setToken} error={error} setError={setError} />;
+  }
+
+  return (
+    <div className="shell">
+      <aside className="sidebar">
+        <div>
+          <div className="brand">DumplySquirrel</div>
+          <p className="muted">備份管理系統</p>
+        </div>
+        <nav>
+          <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
+          <button className={tab === 'configs' ? 'active' : ''} onClick={() => setTab('configs')}>備份設定</button>
+          <button className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}>歷史記錄</button>
+          <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>使用者</button>
+        </nav>
+        <div className="sidebar-footer">
+          <span>{user.username}</span>
+          <button className="ghost" onClick={logout}>登出</button>
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <div>
+            <h1>{tabTitle(tab)}</h1>
+            <p className="muted">{loading ? '同步資料中...' : '系統狀態已同步'}</p>
+          </div>
+          <button onClick={refreshAll}>重新整理</button>
+        </header>
+        {error && <div className="alert">{error}</div>}
+        {tab === 'dashboard' && <Dashboard stats={stats} configs={configs} history={history} />}
+        {tab === 'configs' && <Configs api={api} configs={configs} refresh={refreshAll} setError={setError} />}
+        {tab === 'history' && <History api={api} history={history} configs={configs} refresh={refreshAll} setError={setError} />}
+        {tab === 'users' && <Users api={api} users={users} refresh={refreshAll} setError={setError} currentUser={user} />}
+      </main>
+    </div>
+  );
+}
+
+function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin: (token: string) => void; error: string | null; setError: (error: string | null) => void }) {
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await api.login(username, password);
+      onLogin(response.token);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '登入失敗');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="login-page">
+      <section className="login-card">
+        <p className="eyebrow">DumplySquirrel</p>
+        <h1>登入備份管理台</h1>
+        <form onSubmit={submit}>
+          <label>帳號<input value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+          <label>密碼<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          {error && <div className="alert">{error}</div>}
+          <button disabled={loading}>{loading ? '登入中...' : '登入'}</button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+function Dashboard({ stats, configs, history }: { stats: DashboardStats | null; configs: BackupConfig[]; history: BackupHistory[] }) {
+  const latest = history.slice(0, 6);
+  return (
+    <section className="grid">
+      <Metric title="任務數" value={stats?.total_configs ?? configs.length} />
+      <Metric title="備份次數" value={stats?.total_backups ?? history.length} />
+      <Metric title="成功" value={stats?.success_count ?? 0} />
+      <Metric title="失敗" value={stats?.failed_count ?? 0} />
+      <Metric title="儲存用量" value={formatBytes(stats?.storage_bytes)} />
+      <div className="panel wide">
+        <h2>最近備份</h2>
+        <HistoryTable history={latest} configs={configs} compact />
+      </div>
+    </section>
+  );
+}
+
+function Metric({ title, value }: { title: string; value: string | number }) {
+  return <div className="metric"><span>{title}</span><strong>{value}</strong></div>;
+}
+
+function dbVersionOptions(dbType: 'postgres' | 'mysql') {
+  if (dbType === 'postgres') {
+    return [
+      { value: '', label: 'Auto detect' },
+      { value: '14', label: 'PostgreSQL 14' },
+      { value: '15', label: 'PostgreSQL 15' },
+      { value: '16', label: 'PostgreSQL 16' },
+      { value: '17', label: 'PostgreSQL 17' },
+      { value: '18', label: 'PostgreSQL 18' },
+    ];
+  }
+
+  return [
+    { value: '', label: 'Auto detect' },
+    { value: '8.0', label: 'MySQL 8.0' },
+    { value: '8.4', label: 'MySQL 8.4 LTS' },
+    { value: '9.7', label: 'MySQL 9.7 LTS' },
+  ];
+}
+
+function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs: BackupConfig[]; refresh: () => Promise<void>; setError: (error: string | null) => void }) {
+  const [form, setForm] = useState(emptyConfigForm);
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    const payload: ConfigPayload = {
+      name: form.name,
+      db_type: form.db_type,
+      db_version: form.db_version || null,
+      db_url: form.db_url,
+      cron_schedule: form.cron_schedule.trim() || null,
+      retention_days: Number(form.retention_days),
+      timeout_seconds: Number(form.timeout_seconds),
+      max_backups: form.max_backups === '' ? null : Number(form.max_backups),
+      is_enabled: form.is_enabled,
+    };
+    try {
+      if (editingId) {
+        await api.updateConfig(editingId, payload);
+      } else {
+        await api.createConfig(payload);
+      }
+      setEditingId(null);
+      setForm(emptyConfigForm);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '儲存設定失敗');
+    }
+  }
+
+  function edit(config: BackupConfig) {
+    setEditingId(config.id);
+    setForm({
+      name: config.name,
+      db_type: config.db_type,
+      db_version: config.db_version ?? '',
+      db_url: '',
+      cron_schedule: config.cron_schedule ?? '',
+      retention_days: config.retention_days,
+      timeout_seconds: config.timeout_seconds,
+      max_backups: config.max_backups?.toString() ?? '',
+      is_enabled: config.is_enabled,
+    });
+  }
+
+  return (
+    <section className="two-column">
+      <form className="panel form" onSubmit={submit}>
+        <h2>{editingId ? '更新備份設定' : '新增備份設定'}</h2>
+        {editingId && <p className="muted">更新設定需要重新輸入完整 DB URL，API 不會回傳密碼。</p>}
+        <label>名稱<input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
+        <label>資料庫類型<select value={form.db_type} onChange={(event) => setForm({ ...form, db_type: event.target.value as 'postgres' | 'mysql', db_version: '' })}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
+        <label>Dump 版本<select value={form.db_version} onChange={(event) => setForm({ ...form, db_version: event.target.value })}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        {form.db_type === 'mysql' && <p className="muted">MySQL 目前使用系統 mysqldump；版本選項只作為設定標示用途。</p>}
+        <label>DB URL<input required placeholder="postgres://user:pass@host:5432/db" value={form.db_url} onChange={(event) => setForm({ ...form, db_url: event.target.value })} /></label>
+        <label>Cron<input placeholder="0 0 2 * * *" value={form.cron_schedule} onChange={(event) => setForm({ ...form, cron_schedule: event.target.value })} /></label>
+        <div className="form-row">
+          <label>保留天數<input type="number" min="1" value={form.retention_days} onChange={(event) => setForm({ ...form, retention_days: Number(event.target.value) })} /></label>
+          <label>Timeout 秒<input type="number" min="1" value={form.timeout_seconds} onChange={(event) => setForm({ ...form, timeout_seconds: Number(event.target.value) })} /></label>
+        </div>
+        <label>最多保留份數<input type="number" min="1" value={form.max_backups} onChange={(event) => setForm({ ...form, max_backups: event.target.value })} /></label>
+        <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(event) => setForm({ ...form, is_enabled: event.target.checked })} />啟用排程</label>
+        <button>{editingId ? '更新設定' : '建立設定'}</button>
+        {editingId && <button type="button" className="ghost" onClick={() => { setEditingId(null); setForm(emptyConfigForm); }}>取消編輯</button>}
+      </form>
+
+      <div className="panel">
+        <h2>備份設定</h2>
+        <div className="cards">
+          {configs.map((config) => (
+            <article className="config-card" key={config.id}>
+              <div><h3>{config.name}</h3><p>{config.db_url_masked}</p></div>
+              <StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} />
+              <p>Cron: {config.cron_schedule || '手動'}</p>
+              <p>Dump 版本: {config.db_version ?? 'Auto'}</p>
+              <div className="actions">
+                <button onClick={() => api.triggerConfig(config.id).then(refresh).catch((err) => setError(err.message))}>立即備份</button>
+                <button className="ghost" onClick={() => api.toggleConfig(config.id, !config.is_enabled).then(refresh).catch((err) => setError(err.message))}>{config.is_enabled ? '停用' : '啟用'}</button>
+                <button className="ghost" onClick={() => edit(config)}>編輯</button>
+                <button className="danger" onClick={() => api.deleteConfig(config.id).then(refresh).catch((err) => setError(err.message))}>刪除</button>
+              </div>
+            </article>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function History({ api, history, configs, refresh, setError }: { api: ApiClient; history: BackupHistory[]; configs: BackupConfig[]; refresh: () => Promise<void>; setError: (error: string | null) => void }) {
+  return (
+    <section className="panel">
+      <div className="panel-heading"><h2>歷史記錄</h2><button onClick={refresh}>重新整理</button></div>
+      <HistoryTable history={history} configs={configs} onDownload={(id) => api.downloadHistory(id).catch((err) => setError(err.message))} />
+    </section>
+  );
+}
+
+function HistoryTable({ history, configs, compact = false, onDownload }: { history: BackupHistory[]; configs: BackupConfig[]; compact?: boolean; onDownload?: (id: string) => void }) {
+  const names = new Map(configs.map((config) => [config.id, config.name]));
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr><th>任務</th><th>狀態</th><th>觸發</th><th>大小</th><th>開始</th>{!compact && <th>操作</th>}</tr></thead>
+        <tbody>
+          {history.map((row) => (
+            <tr key={row.id}>
+              <td>{names.get(row.config_id) ?? row.config_id.slice(0, 8)}</td>
+              <td><StatusBadge status={row.status} /></td>
+              <td>{row.triggered_by}</td>
+              <td>{formatBytes(row.file_size)}</td>
+              <td>{new Date(row.started_at).toLocaleString()}</td>
+              {!compact && <td>{row.status === 'success' && <button onClick={() => onDownload?.(row.id)}>下載</button>}</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {history.length === 0 && <p className="muted empty">尚無記錄</p>}
+    </div>
+  );
+}
+
+function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient; users: User[]; refresh: () => Promise<void>; setError: (error: string | null) => void; currentUser: User }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    try {
+      await api.createUser(username, password);
+      setUsername('');
+      setPassword('');
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '建立使用者失敗');
+    }
+  }
+
+  return (
+    <section className="two-column narrow">
+      <form className="panel form" onSubmit={submit}>
+        <h2>新增管理員</h2>
+        <label>帳號<input required value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+        <label>密碼<input required type="password" minLength={12} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        <button>建立使用者</button>
+      </form>
+      <div className="panel">
+        <h2>使用者</h2>
+        <table>
+          <thead><tr><th>帳號</th><th>角色</th><th>操作</th></tr></thead>
+          <tbody>{users.map((item) => <tr key={item.id}><td>{item.username}</td><td>{item.role}</td><td>{item.id !== currentUser.id && <button className="danger" onClick={() => api.deleteUser(item.id).then(refresh).catch((err) => setError(err.message))}>刪除</button>}</td></tr>)}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  return <span className={`badge ${status}`}>{status}</span>;
+}
+
+function tabTitle(tab: Tab) {
+  return ({ dashboard: 'Dashboard', configs: '備份設定', history: '歷史記錄', users: '使用者管理' } satisfies Record<Tab, string>)[tab];
+}
