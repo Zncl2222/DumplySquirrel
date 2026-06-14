@@ -1014,41 +1014,4 @@ fn mysql_option_file(target: &DumpTarget) -> AppResult<NamedTempFile> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_matching_database_url_scheme() {
-        assert!(validate_database_url("postgres", "postgres://user:pass@localhost/app").is_ok());
-        assert!(validate_database_url("mysql", "mysql://user:pass@localhost/app").is_ok());
-        assert!(validate_database_url("mysql", "postgres://user:pass@localhost/app").is_err());
-    }
-
-    #[test]
-    fn rejects_newlines_in_database_url_components() {
-        assert!(
-            validate_database_url("postgres", "postgres://user%0A:pass@localhost/app").is_err()
-        );
-    }
-
-    #[test]
-    fn parses_supported_postgres_server_versions() {
-        assert_eq!(
-            postgres_major_from_server_version_num("160002").unwrap(),
-            "16"
-        );
-        assert_eq!(
-            postgres_major_from_server_version_num("180000").unwrap(),
-            "18"
-        );
-        assert!(postgres_major_from_server_version_num("130000").is_err());
-    }
-
-    #[test]
-    fn parses_pg_dump_major_version() {
-        assert_eq!(
-            postgres_major_from_pg_dump_version("pg_dump (PostgreSQL) 16.4").unwrap(),
-            "16"
-        );
-    }
-}
+mod tests;

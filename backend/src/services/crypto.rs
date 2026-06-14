@@ -52,24 +52,4 @@ pub fn mask_database_url(input: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encrypt_decrypt_roundtrip() {
-        let key = "test key with enough entropy";
-        let plaintext = "postgres://user:secret@example.com:5432/app";
-
-        let (ciphertext, nonce) = encrypt_string(plaintext, key).unwrap();
-        assert_ne!(ciphertext, plaintext);
-        assert_eq!(decrypt_string(&ciphertext, &nonce, key).unwrap(), plaintext);
-    }
-
-    #[test]
-    fn mask_database_url_hides_password() {
-        let masked = mask_database_url("postgres://user:secret@example.com:5432/app");
-
-        assert!(masked.contains("user:****@"));
-        assert!(!masked.contains("secret"));
-    }
-}
+mod tests;

@@ -256,3 +256,6 @@ pub fn require_admin(user: &AuthUser) -> AppResult<()> {
         Err(AppError::Forbidden)
     }
 }
+
+#[cfg(test)]
+mod tests;

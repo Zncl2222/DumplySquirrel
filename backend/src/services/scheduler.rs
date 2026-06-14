@@ -150,3 +150,6 @@ pub fn validate_cron_expression(schedule: &str) -> AppResult<()> {
         .map_err(|err| AppError::Validation(format!("invalid cron_schedule: {err}")))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
