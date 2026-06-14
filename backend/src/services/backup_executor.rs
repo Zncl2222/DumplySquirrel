@@ -103,13 +103,42 @@ async fn run_backup(
     config: BackupConfig,
     history_id: Uuid,
 ) -> AppResult<()> {
-    let permit = tokio::time::timeout(
+    backup_event(
+        &runtime.db,
+        history_id,
+        "queued",
+        "info",
+        "Backup worker queued for an execution slot.",
+    )
+    .await;
+    let permit_result = tokio::time::timeout(
         Duration::from_secs(30),
         runtime.permits.clone().acquire_owned(),
     )
-    .await
-    .map_err(|_| AppError::Conflict("backup queue is full; try again later".into()))?
-    .map_err(|err| AppError::Internal(err.into()))?;
+    .await;
+    let permit = match permit_result {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(err)) => {
+            let err = AppError::Internal(err.into());
+            backup_event(&runtime.db, history_id, "queued", "error", &err.to_string()).await;
+            mark_failed_if_running(&runtime.db, history_id, "failed", &err.to_string()).await?;
+            return Err(err);
+        }
+        Err(_) => {
+            let err = AppError::Conflict("backup queue is full; try again later".into());
+            backup_event(&runtime.db, history_id, "queued", "error", &err.to_string()).await;
+            mark_failed_if_running(&runtime.db, history_id, "failed", &err.to_string()).await?;
+            return Err(err);
+        }
+    };
+    backup_event(
+        &runtime.db,
+        history_id,
+        "queued",
+        "success",
+        "Execution slot acquired.",
+    )
+    .await;
 
     let result = execute_backup(&runtime, &config, history_id).await;
     drop(permit);
@@ -135,6 +164,14 @@ async fn execute_backup(
     tokio::fs::create_dir_all(&runtime.config.backup_dir)
         .await
         .map_err(|err| AppError::Internal(err.into()))?;
+    backup_event(
+        &runtime.db,
+        history_id,
+        "prepare",
+        "success",
+        "Backup directory is ready.",
+    )
+    .await;
 
     let db_url = crypto::decrypt_string(
         &config.db_url_encrypted,
@@ -143,12 +180,33 @@ async fn execute_backup(
     )?;
     let target = DumpTarget::parse(&db_url)?;
     target.validate_db_type(&config.db_type)?;
+    backup_event(
+        &runtime.db,
+        history_id,
+        "connect",
+        "success",
+        &format!(
+            "Target accepted for {} on {}:{}.",
+            config.db_type, target.host, target.port
+        ),
+    )
+    .await;
     let file_name = format!("{}_{}.sql", config.id, Utc::now().format("%Y%m%d_%H%M%S"));
     let output_path = runtime.config.backup_dir.join(&file_name);
+    backup_event(
+        &runtime.db,
+        history_id,
+        "prepare",
+        "info",
+        &format!("Output file reserved as `{file_name}`."),
+    )
+    .await;
 
     let dump_result = match config.db_type.as_str() {
         "postgres" => {
             run_pg_dump(
+                &runtime.db,
+                history_id,
                 &target,
                 &output_path,
                 config.db_version.as_deref(),
@@ -158,6 +216,8 @@ async fn execute_backup(
         }
         "mysql" => {
             run_mysqldump(
+                &runtime.db,
+                history_id,
                 &target,
                 &output_path,
                 config.db_version.as_deref(),
@@ -174,12 +234,44 @@ async fn execute_backup(
                 .await
                 .map_err(|err| AppError::Internal(err.into()))?
                 .len() as i64;
+            backup_event(
+                &runtime.db,
+                history_id,
+                "seal",
+                "success",
+                &format!("Backup file sealed at {file_size} bytes."),
+            )
+            .await;
             mark_success(&runtime.db, history_id, &file_name, &output_path, file_size).await?;
+            backup_event(
+                &runtime.db,
+                history_id,
+                "retention",
+                "info",
+                "Applying retention rules.",
+            )
+            .await;
             apply_retention(runtime, config).await?;
+            backup_event(
+                &runtime.db,
+                history_id,
+                "done",
+                "success",
+                "Backup completed successfully.",
+            )
+            .await;
             Ok(())
         }
         Err(AppError::BackupTimeout) => {
             cleanup_partial_file(&output_path).await;
+            backup_event(
+                &runtime.db,
+                history_id,
+                "timeout",
+                "error",
+                "Backup process timed out. Partial file was removed.",
+            )
+            .await;
             mark_failed(
                 &runtime.db,
                 history_id,
@@ -192,6 +284,7 @@ async fn execute_backup(
         }
         Err(err) => {
             cleanup_partial_file(&output_path).await;
+            backup_event(&runtime.db, history_id, "failed", "error", &err.to_string()).await;
             mark_failed(&runtime.db, history_id, "failed", &err.to_string(), None).await?;
             Err(err)
         }
@@ -199,6 +292,8 @@ async fn execute_backup(
 }
 
 async fn run_pg_dump(
+    pool: &PgPool,
+    history_id: Uuid,
     target: &DumpTarget,
     output_path: &Path,
     configured_version: Option<&str>,
@@ -208,11 +303,48 @@ async fn run_pg_dump(
         .map(str::trim)
         .filter(|version| !version.is_empty() && !version.eq_ignore_ascii_case("auto"));
     let major_version = match configured_version {
-        Some(version) => version.trim().to_string(),
-        None => detect_postgres_major_version(target, timeout_seconds).await?,
+        Some(version) => {
+            backup_event(
+                pool,
+                history_id,
+                "probe",
+                "info",
+                &format!("Using configured PostgreSQL {version}."),
+            )
+            .await;
+            version.trim().to_string()
+        }
+        None => {
+            backup_event(
+                pool,
+                history_id,
+                "probe",
+                "info",
+                "Detecting PostgreSQL server version.",
+            )
+            .await;
+            let version = detect_postgres_major_version(target, timeout_seconds).await?;
+            backup_event(
+                pool,
+                history_id,
+                "probe",
+                "success",
+                &format!("Detected PostgreSQL server version {version}."),
+            )
+            .await;
+            version
+        }
     };
     let command_path = resolve_pg_dump_command(&major_version).await?;
     tracing::info!(postgres_version = %major_version, pg_dump = %command_path, "using PostgreSQL pg_dump client");
+    backup_event(
+        pool,
+        history_id,
+        "client",
+        "success",
+        &format!("Using `{command_path}` for PostgreSQL {major_version}."),
+    )
+    .await;
     let output = File::create(output_path).map_err(|err| AppError::Internal(err.into()))?;
     let mut command = Command::new(&command_path);
     command
@@ -230,10 +362,22 @@ async fn run_pg_dump(
         command.env("PGPASSWORD", password);
     }
 
-    run_command(&command_path, command, timeout_seconds).await
+    backup_event(pool, history_id, "dump", "info", "pg_dump process started.").await;
+    run_command(&command_path, command, timeout_seconds).await?;
+    backup_event(
+        pool,
+        history_id,
+        "dump",
+        "success",
+        "pg_dump process exited successfully.",
+    )
+    .await;
+    Ok(())
 }
 
 async fn run_mysqldump(
+    pool: &PgPool,
+    history_id: Uuid,
     target: &DumpTarget,
     output_path: &Path,
     configured_version: Option<&str>,
@@ -243,10 +387,47 @@ async fn run_mysqldump(
         .map(str::trim)
         .filter(|version| !version.is_empty() && !version.eq_ignore_ascii_case("auto"));
     let version = match configured_version {
-        Some(version) => version.trim().to_string(),
-        None => detect_mysql_version(target, timeout_seconds).await?,
+        Some(version) => {
+            backup_event(
+                pool,
+                history_id,
+                "probe",
+                "info",
+                &format!("Using configured MySQL {version}."),
+            )
+            .await;
+            version.trim().to_string()
+        }
+        None => {
+            backup_event(
+                pool,
+                history_id,
+                "probe",
+                "info",
+                "Detecting MySQL server version.",
+            )
+            .await;
+            let version = detect_mysql_version(target, timeout_seconds).await?;
+            backup_event(
+                pool,
+                history_id,
+                "probe",
+                "success",
+                &format!("Detected MySQL server version {version}."),
+            )
+            .await;
+            version
+        }
     };
     tracing::info!(mysql_version = %version, "using system mysqldump for MySQL backup");
+    backup_event(
+        pool,
+        history_id,
+        "client",
+        "success",
+        &format!("Using system `mysqldump` for MySQL {version}."),
+    )
+    .await;
     let option_file = mysql_option_file(target)?;
     let output = File::create(output_path).map_err(|err| AppError::Internal(err.into()))?;
     let option_path = option_file.path().to_path_buf();
@@ -257,8 +438,26 @@ async fn run_mysqldump(
         .stdout(Stdio::from(output))
         .stderr(Stdio::piped());
 
+    backup_event(
+        pool,
+        history_id,
+        "dump",
+        "info",
+        "mysqldump process started.",
+    )
+    .await;
     let result = run_command("mysqldump", command, timeout_seconds).await;
     drop(option_file);
+    if result.is_ok() {
+        backup_event(
+            pool,
+            history_id,
+            "dump",
+            "success",
+            "mysqldump process exited successfully.",
+        )
+        .await;
+    }
     result
 }
 
@@ -528,6 +727,25 @@ async fn mark_failed_if_running(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+async fn backup_event(pool: &PgPool, history_id: Uuid, stage: &str, level: &str, message: &str) {
+    if let Err(err) = sqlx::query(
+        r#"
+        INSERT INTO backup_events (id, history_id, stage, level, message)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(history_id)
+    .bind(stage)
+    .bind(level)
+    .bind(message)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(history_id = %history_id, stage = %stage, error = ?err, "failed to write backup event");
+    }
 }
 
 async fn apply_retention(runtime: &BackupRuntime, config: &BackupConfig) -> AppResult<()> {

@@ -8,3 +8,4 @@ dist/
 backups/
 backups-dev/
 certs/
+.superpowers/

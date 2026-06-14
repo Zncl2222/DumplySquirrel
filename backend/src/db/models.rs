@@ -45,3 +45,14 @@ pub struct BackupHistory {
     pub completed_at: Option<DateTime<Utc>>,
     pub triggered_by: String,
 }
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct BackupEvent {
+    pub id: Uuid,
+    pub history_id: Uuid,
+    pub sequence: i64,
+    pub stage: String,
+    pub level: String,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+}

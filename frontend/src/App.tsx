@@ -2,15 +2,22 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 import {
   ApiClient,
   BackupConfig,
+  BackupEvent,
   BackupHistory,
   ConfigPayload,
   DashboardStats,
+  RunningBackup,
   User,
   cronToHuman,
   formatBytes,
 } from './api';
 
 type Tab = 'dashboard' | 'configs' | 'history' | 'users';
+
+type RefreshOptions = {
+  historyConfigId?: string | null;
+  historyPage?: number;
+};
 
 type ConfigFormState = {
   name: string;
@@ -159,6 +166,9 @@ export function App() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [configs, setConfigs] = useState<BackupConfig[]>([]);
   const [history, setHistory] = useState<BackupHistory[]>([]);
+  const [runningBackups, setRunningBackups] = useState<RunningBackup[]>([]);
+  const [focusedHistory, setFocusedHistory] = useState<BackupHistory | null>(null);
+  const [historyConfigId, setHistoryConfigId] = useState<string | null>(null);
   const [historyPage, setHistoryPage] = useState(1);
   const [historyHasNext, setHistoryHasNext] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
@@ -176,21 +186,44 @@ export function App() {
     }
   }, [api, token]);
 
-  async function refreshAll() {
+  useEffect(() => {
+    if (!token || !user) return;
+    let cancelled = false;
+    async function pollRunRoom() {
+      try {
+        const runs = await api.runningBackups();
+        if (!cancelled) setRunningBackups(runs);
+      } catch {
+        // Keep the global shell quiet during background polling.
+      }
+    }
+    void pollRunRoom();
+    const timer = window.setInterval(pollRunRoom, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [api, token, user]);
+
+  async function refreshAll(options: RefreshOptions = {}) {
+    const requestedHistoryConfigId = 'historyConfigId' in options ? options.historyConfigId : historyConfigId;
+    const requestedHistoryPage = options.historyPage ?? historyPage;
     setLoading(true);
     setError(null);
     try {
-      const [me, dashboardStats, backupConfigs, backupHistory, userList] = await Promise.all([
+      const [me, dashboardStats, backupConfigs, backupHistory, activeRuns, userList] = await Promise.all([
         api.me(),
         api.stats(),
         api.configs(),
-        api.history({ page: historyPage, per_page: 20 }),
+        api.history({ page: requestedHistoryPage, per_page: 20, config_id: requestedHistoryConfigId ?? undefined }),
+        api.runningBackups(),
         api.users(),
       ]);
       setUser(me);
       setStats(dashboardStats);
       setConfigs(backupConfigs);
       setHistory(backupHistory.data);
+      setRunningBackups(activeRuns);
       setHistoryPage(backupHistory.pagination.page);
       setHistoryHasNext(backupHistory.pagination.has_next);
       setUsers(userList);
@@ -216,16 +249,17 @@ export function App() {
       setStats(null);
       setConfigs([]);
       setHistory([]);
+      setRunningBackups([]);
       setUsers([]);
       setLoading(false);
     }
   }
 
-  async function loadHistoryPage(page: number) {
+  async function loadHistoryPage(page: number, configId = historyConfigId) {
     setLoading(true);
     setError(null);
     try {
-      const response = await api.history({ page, per_page: 20 });
+      const response = await api.history({ page, per_page: 20, config_id: configId ?? undefined });
       setHistory(response.data);
       setHistoryPage(response.pagination.page);
       setHistoryHasNext(response.pagination.has_next);
@@ -236,6 +270,26 @@ export function App() {
     }
   }
 
+  function openDashboard() {
+    setHistoryConfigId(null);
+    setTab('dashboard');
+    void loadHistoryPage(1, null);
+  }
+
+  function openAllHistory() {
+    setFocusedHistory(null);
+    setHistoryConfigId(null);
+    setTab('history');
+    void loadHistoryPage(1, null);
+  }
+
+  function openConfigHistory(config: BackupConfig) {
+    setFocusedHistory(null);
+    setHistoryConfigId(config.id);
+    setTab('history');
+    void loadHistoryPage(1, config.id);
+  }
+
   if (!token || !user) {
     return <LoginPage api={api} onLogin={setToken} error={error} setError={setError} />;
   }
@@ -243,14 +297,23 @@ export function App() {
   return (
     <div className="shell">
       <aside className="sidebar">
-        <div>
-          <div className="brand">DumplySquirrel</div>
-          <p className="muted">備份管理系統</p>
+        <div className="brand-lockup">
+          <img
+            className="brand-icon"
+            src="/assets/dumply-squirrel-icon.png"
+            alt=""
+            aria-hidden="true"
+            draggable="false"
+          />
+          <div>
+            <div className="brand">DumplySquirrel</div>
+            <p className="muted">備份管理系統</p>
+          </div>
         </div>
         <nav>
-          <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
+          <button className={tab === 'dashboard' ? 'active' : ''} onClick={openDashboard}>Dashboard</button>
           <button className={tab === 'configs' ? 'active' : ''} onClick={() => setTab('configs')}>備份設定</button>
-          <button className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}>歷史記錄</button>
+          <button className={tab === 'history' ? 'active' : ''} onClick={openAllHistory}>歷史記錄</button>
           <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>使用者</button>
         </nav>
         <div className="sidebar-footer">
@@ -265,12 +328,12 @@ export function App() {
             <h1>{tabTitle(tab)}</h1>
             <p className="muted">{loading ? '同步資料中...' : '系統狀態已同步'}</p>
           </div>
-          <button onClick={refreshAll}>重新整理</button>
+          <button onClick={() => void refreshAll()}>重新整理</button>
         </header>
         {error && <div className="alert">{error}</div>}
         {tab === 'dashboard' && <Dashboard stats={stats} configs={configs} history={history} />}
-        {tab === 'configs' && <Configs api={api} configs={configs} refresh={refreshAll} setError={setError} />}
-        {tab === 'history' && <History api={api} history={history} configs={configs} page={historyPage} hasNext={historyHasNext} refresh={refreshAll} setError={setError} onPageChange={loadHistoryPage} />}
+        {tab === 'configs' && <Configs api={api} configs={configs} runningBackups={runningBackups} refresh={refreshAll} setError={setError} onViewHistory={openConfigHistory} onBackupStarted={(row) => { setFocusedHistory(row); setHistoryConfigId(row.config_id); setTab('history'); }} />}
+        {tab === 'history' && <History api={api} history={history} runningBackups={runningBackups} focusedHistory={focusedHistory} configs={configs} selectedConfigId={historyConfigId} page={historyPage} hasNext={historyHasNext} refresh={refreshAll} setError={setError} onPageChange={loadHistoryPage} onShowAll={openAllHistory} onFocusedHistoryConsumed={() => setFocusedHistory(null)} />}
         {tab === 'users' && <Users api={api} users={users} refresh={refreshAll} setError={setError} currentUser={user} />}
       </main>
     </div>
@@ -299,7 +362,10 @@ function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin:
   return (
     <main className="login-page">
       <section className="login-card">
-        <p className="eyebrow">DumplySquirrel</p>
+        <div className="login-brand">
+          <img className="brand-icon" src="/assets/dumply-squirrel-icon.png" alt="" aria-hidden="true" draggable="false" />
+          <p className="eyebrow">DumplySquirrel</p>
+        </div>
         <h1>登入備份管理台</h1>
         <form onSubmit={submit}>
           <label>帳號<input value={username} onChange={(event) => setUsername(event.target.value)} /></label>
@@ -333,6 +399,115 @@ function Metric({ title, value }: { title: string; value: string | number }) {
   return <div className="metric"><span>{title}</span><strong>{value}</strong></div>;
 }
 
+const runStages = [
+  { key: 'queued', label: 'queue' },
+  { key: 'connect', label: 'connect' },
+  { key: 'probe', label: 'probe' },
+  { key: 'client', label: 'client' },
+  { key: 'dump', label: 'dump' },
+  { key: 'seal', label: 'seal' },
+  { key: 'retention', label: 'retain' },
+  { key: 'done', label: 'done' },
+];
+
+function RunRoomDetail({ history, configName, events, loading, onBack }: { history: BackupHistory; configName: string; events: BackupEvent[]; loading: boolean; onBack: () => void }) {
+  const currentStage = stageFromEvents(events, history.status);
+  const isRunning = history.status === 'running';
+  const startedAt = new Date(history.started_at).toLocaleString();
+
+  return (
+    <section className="run-detail-panel" aria-labelledby="run-detail-title">
+      <nav className="run-breadcrumb" aria-label="歷史記錄路徑">
+        <span>歷史記錄</span>
+        <span aria-hidden="true">/</span>
+        <span>{configName}</span>
+        <span aria-hidden="true">/</span>
+        <span>{startedAt}</span>
+      </nav>
+
+      <header className="run-detail-heading">
+        <div className="run-detail-title">
+          <button className="run-back" onClick={onBack}>← 返回歷史記錄</button>
+          <p className="run-kicker">備份執行詳情</p>
+          <h2 id="run-detail-title">{configName}</h2>
+          <p>{isRunning ? '這筆備份正在執行，事件會每 2 秒更新。' : '這是該筆備份留下的流程與事件紀錄。'}</p>
+        </div>
+        <div className="run-detail-badges">
+          <StatusBadge status={history.status} />
+          {isRunning && <span className="run-polling">polling 2s</span>}
+        </div>
+      </header>
+
+      <div className="run-facts">
+        <RunFact label="狀態" value={history.status} />
+        <RunFact label="階段" value={stageLabel(currentStage)} />
+        <RunFact label={isRunning ? '已執行' : '耗時'} value={runDuration(history)} />
+        <RunFact label="觸發" value={history.triggered_by} />
+      </div>
+
+      <main className="run-log-panel" aria-label="備份事件 log">
+        <div className="run-log-head">
+          <div>
+            <p className="run-kicker">事件紀錄</p>
+            <h2>{loading ? '載入事件中' : '事件紀錄'}</h2>
+          </div>
+        </div>
+        <RunLog events={events} history={history} />
+      </main>
+    </section>
+  );
+}
+
+function RunFact({ label, value }: { label: string; value: string }) {
+  return <div className="run-fact"><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function RunLog({ events, history }: { events: BackupEvent[]; history: BackupHistory | null }) {
+  if (!history) {
+    return <div className="run-log-empty">還沒有正在執行的備份。啟動任務後，事件會在這裡逐行出現。</div>;
+  }
+
+  return (
+    <div className="run-log-lines" aria-live="polite">
+      {events.length > 0 ? events.map((event) => (
+        <div key={event.id} className={`run-log-line level-${event.level}`}>
+          <span className="run-log-time">{new Date(event.created_at).toLocaleTimeString()}</span>
+          <span className="run-log-stage">{event.stage}</span>
+          <span>{event.message}</span>
+        </div>
+      )) : <div className="run-log-empty">備份已建立，正在等待第一筆事件。</div>}
+      {history.error_message && <div className="run-log-error">{history.error_message}</div>}
+    </div>
+  );
+}
+
+function stageFromEvents(events: BackupEvent[], status?: string) {
+  const last = events.at(-1)?.stage;
+  if (last) return last;
+  if (status === 'success') return 'done';
+  if (status === 'failed' || status === 'timeout') return 'failed';
+  return 'queued';
+}
+
+function stageLabel(stage: string) {
+  return runStages.find((item) => item.key === stage)?.label ?? stage;
+}
+
+function elapsedTime(startedAt: string) {
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+}
+
+function runDuration(history: BackupHistory) {
+  if (!history.completed_at) return elapsedTime(history.started_at);
+  const seconds = Math.max(0, Math.floor((new Date(history.completed_at).getTime() - new Date(history.started_at).getTime()) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+}
+
 function dbVersionOptions(dbType: 'postgres' | 'mysql') {
   if (dbType === 'postgres') {
     return [
@@ -353,7 +528,7 @@ function dbVersionOptions(dbType: 'postgres' | 'mysql') {
   ];
 }
 
-function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs: BackupConfig[]; refresh: () => Promise<void>; setError: (error: string | null) => void }) {
+function Configs({ api, configs, runningBackups, refresh, setError, onViewHistory, onBackupStarted }: { api: ApiClient; configs: BackupConfig[]; runningBackups: RunningBackup[]; refresh: (options?: RefreshOptions) => Promise<void>; setError: (error: string | null) => void; onViewHistory: (config: BackupConfig) => void; onBackupStarted: (history: BackupHistory) => void }) {
   const [form, setForm] = useState(emptyConfigForm);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
@@ -363,6 +538,7 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
   const [typeFilter, setTypeFilter] = useState<'all' | 'postgres' | 'mysql'>('all');
   const panelFormRef = useRef<HTMLFormElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const runningConfigIds = useMemo(() => new Set(runningBackups.map((run) => run.history.config_id)), [runningBackups]);
 
   const filtered = useMemo(() => configs.filter((config) => {
     if (typeFilter !== 'all' && config.db_type !== typeFilter) return false;
@@ -473,6 +649,17 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
     }
   }
 
+  async function triggerBackup(config: BackupConfig) {
+    setError(null);
+    try {
+      const row = await api.triggerConfig(config.id);
+      onBackupStarted(row);
+      await refresh({ historyConfigId: row.config_id, historyPage: 1 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '啟動備份失敗');
+    }
+  }
+
   return (
     <section className="configs-page">
       <div className="config-header">
@@ -495,49 +682,52 @@ function Configs({ api, configs, refresh, setError }: { api: ApiClient; configs:
 
       {filtered.length > 0 ? (
         <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
-          <table className="config-table">
-            <thead>
-              <tr>
-                <th>名稱</th>
-                <th>類型</th>
-                <th>版本</th>
-                <th>排程</th>
-                <th>保留</th>
-                <th>狀態</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((config) => (
-                <tr key={config.id} className={`row-${config.db_type}`}>
-                  <td>
-                    <div className="config-name">{config.name}</div>
-                    <span className="config-url" title={config.db_url_masked}>{config.db_url_masked}</span>
-                  </td>
-                  <td>
-                    <span className={`db-type-badge ${config.db_type}`}>
-                      {config.db_type === 'postgres' ? 'PG' : 'MY'}
-                    </span>
-                  </td>
-                  <td className="config-retention">{config.db_version ?? 'Auto'}</td>
-                  <td className="config-schedule">
-                    {scheduleSummary(config.cron_schedule ?? '')}
-                    {config.cron_schedule && <code title={config.cron_schedule}>{config.cron_schedule}</code>}
-                  </td>
-                  <td className="config-retention">{config.retention_days} 天</td>
-                  <td><StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} /></td>
-                  <td>
-                    <div className="config-actions">
-                      <button className="ghost" onClick={() => api.triggerConfig(config.id).then(refresh).catch((err) => setError(err.message))}>備份</button>
-                      <button className="ghost" onClick={() => api.toggleConfig(config.id, !config.is_enabled).then(refresh).catch((err) => setError(err.message))}>{config.is_enabled ? '停用' : '啟用'}</button>
-                      <button className="ghost" onClick={() => openEdit(config)}>編輯</button>
-                      <button className="danger" onClick={() => setDeleteTarget(config)}>刪除</button>
-                    </div>
-                  </td>
+          <div className="table-wrap config-table-wrap">
+            <table className="config-table">
+              <thead>
+                <tr>
+                  <th>名稱</th>
+                  <th>類型</th>
+                  <th>版本</th>
+                  <th>排程</th>
+                  <th>保留</th>
+                  <th>狀態</th>
+                  <th></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {filtered.map((config) => (
+                  <tr key={config.id} className={`row-${config.db_type} ${runningConfigIds.has(config.id) ? 'row-running' : ''}`}>
+                    <td>
+                      <div className="config-name">{config.name}</div>
+                      <span className="config-url" title={config.db_url_masked}>{config.db_url_masked}</span>
+                    </td>
+                    <td>
+                      <span className={`db-type-badge ${config.db_type}`}>
+                        {config.db_type === 'postgres' ? 'PG' : 'MY'}
+                      </span>
+                    </td>
+                    <td className="config-retention">{config.db_version ?? 'Auto'}</td>
+                    <td className="config-schedule">
+                      {scheduleSummary(config.cron_schedule ?? '')}
+                      {config.cron_schedule && <code title={config.cron_schedule}>{config.cron_schedule}</code>}
+                    </td>
+                    <td className="config-retention">{config.retention_days} 天</td>
+                    <td><StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} /></td>
+                    <td>
+                      <div className="config-actions">
+                        <button className="ghost" onClick={() => onViewHistory(config)}>歷史</button>
+                        <button className={`ghost backup-trigger ${runningConfigIds.has(config.id) ? 'running' : ''}`} disabled={runningConfigIds.has(config.id)} onClick={() => void triggerBackup(config)}>{runningConfigIds.has(config.id) ? '備份中' : '備份'}</button>
+                        <button className="ghost" onClick={() => api.toggleConfig(config.id, !config.is_enabled).then(() => refresh()).catch((err) => setError(err.message))}>{config.is_enabled ? '停用' : '啟用'}</button>
+                        <button className="ghost" onClick={() => openEdit(config)}>編輯</button>
+                        <button className="danger" onClick={() => setDeleteTarget(config)}>刪除</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       ) : (
         <div className="config-empty">
@@ -724,11 +914,107 @@ function DeleteConfigDialog({ config, onCancel, onConfirm }: { config: BackupCon
   );
 }
 
-function History({ api, history, configs, page, hasNext, refresh, setError, onPageChange }: { api: ApiClient; history: BackupHistory[]; configs: BackupConfig[]; page: number; hasNext: boolean; refresh: () => Promise<void>; setError: (error: string | null) => void; onPageChange: (page: number) => Promise<void> }) {
+function History({ api, history, runningBackups, focusedHistory, configs, selectedConfigId, page, hasNext, refresh, setError, onPageChange, onShowAll, onFocusedHistoryConsumed }: { api: ApiClient; history: BackupHistory[]; runningBackups: RunningBackup[]; focusedHistory: BackupHistory | null; configs: BackupConfig[]; selectedConfigId: string | null; page: number; hasNext: boolean; refresh: () => Promise<void>; setError: (error: string | null) => void; onPageChange: (page: number) => Promise<void>; onShowAll: () => void; onFocusedHistoryConsumed: () => void }) {
+  const [selectedHistory, setSelectedHistory] = useState<BackupHistory | null>(null);
+  const [selectedEvents, setSelectedEvents] = useState<BackupEvent[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const names = useMemo(() => new Map(configs.map((config) => [config.id, config.name])), [configs]);
+  const selectedConfig = useMemo(() => configs.find((config) => config.id === selectedConfigId) ?? null, [configs, selectedConfigId]);
+  const selectedConfigName = selectedConfig?.name ?? selectedConfigId?.slice(0, 8) ?? null;
+  const mergedHistory = useMemo(() => {
+    const runningRows = runningBackups
+      .filter((run) => !selectedConfigId || run.history.config_id === selectedConfigId)
+      .map((run) => run.history);
+    const runningIds = new Set(runningRows.map((row) => row.id));
+    const historyRows = selectedConfigId
+      ? history.filter((row) => row.config_id === selectedConfigId)
+      : history;
+    return [...runningRows, ...historyRows.filter((row) => !runningIds.has(row.id))];
+  }, [history, runningBackups, selectedConfigId]);
+
+  useEffect(() => {
+    if (!focusedHistory) return;
+    inspect(focusedHistory);
+    onFocusedHistoryConsumed();
+  }, [focusedHistory, onFocusedHistoryConsumed]);
+
+  useEffect(() => {
+    if (!selectedHistory) return;
+    const historyId = selectedHistory.id;
+    const isRunning = selectedHistory.status === 'running';
+    let cancelled = false;
+    async function loadEvents() {
+      setEventsLoading(true);
+      try {
+        const [events, latestHistory] = await Promise.all([
+          api.backupEvents(historyId),
+          isRunning ? api.historyItem(historyId) : Promise.resolve(null),
+        ]);
+        if (!cancelled) {
+          setSelectedEvents(events);
+          if (latestHistory && latestHistory.status !== 'running') setSelectedHistory(latestHistory);
+        }
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : '載入流程事件失敗');
+      } finally {
+        if (!cancelled) setEventsLoading(false);
+      }
+    }
+    void loadEvents();
+    if (!isRunning) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const timer = window.setInterval(loadEvents, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [api, selectedHistory, setError]);
+
+  function inspect(row: BackupHistory) {
+    const activeRun = runningBackups.find((run) => run.history.id === row.id);
+    setSelectedHistory(activeRun?.history ?? row);
+    setSelectedEvents(activeRun?.events ?? []);
+  }
+
+  function closeDetail() {
+    setSelectedHistory(null);
+    setSelectedEvents([]);
+  }
+
+  if (selectedHistory) {
+    const activeRun = runningBackups.find((run) => run.history.id === selectedHistory.id);
+    const currentHistory = activeRun?.history ?? selectedHistory;
+    return (
+      <RunRoomDetail
+        history={currentHistory}
+        configName={names.get(currentHistory.config_id) ?? currentHistory.config_id.slice(0, 8)}
+        events={activeRun?.events ?? selectedEvents}
+        loading={eventsLoading}
+        onBack={closeDetail}
+      />
+    );
+  }
+
   return (
-    <section className="panel">
-      <div className="panel-heading"><h2>歷史記錄</h2><button onClick={refresh}>重新整理</button></div>
-      <HistoryTable history={history} configs={configs} onDownload={(id) => api.downloadHistory(id).catch((err) => setError(err.message))} />
+    <section className="panel history-panel">
+      <div className="panel-heading">
+        <div>
+          <h2>歷史記錄</h2>
+          <p className="muted">
+            {selectedConfigName
+              ? `目前只顯示「${selectedConfigName}」的每一次備份執行紀錄。`
+              : '正在執行的備份會出現在同一張表；點「查看流程」開啟 Run Room 詳情。'}
+          </p>
+        </div>
+        <div className="actions">
+          {selectedConfigId && <button className="ghost" onClick={onShowAll}>查看全部歷史</button>}
+          <button onClick={() => void refresh()}>重新整理</button>
+        </div>
+      </div>
+      <HistoryTable history={mergedHistory} configs={configs} onInspect={inspect} onDownload={(id) => api.downloadHistory(id).catch((err) => setError(err.message))} />
       <div className="pagination">
         <button className="ghost" disabled={page <= 1} onClick={() => void onPageChange(page - 1)}>上一頁</button>
         <span>第 {page} 頁</span>
@@ -738,7 +1024,7 @@ function History({ api, history, configs, page, hasNext, refresh, setError, onPa
   );
 }
 
-function HistoryTable({ history, configs, compact = false, onDownload }: { history: BackupHistory[]; configs: BackupConfig[]; compact?: boolean; onDownload?: (id: string) => void }) {
+function HistoryTable({ history, configs, compact = false, onDownload, onInspect }: { history: BackupHistory[]; configs: BackupConfig[]; compact?: boolean; onDownload?: (id: string) => void; onInspect?: (row: BackupHistory) => void }) {
   const names = new Map(configs.map((config) => [config.id, config.name]));
   return (
     <div className="table-wrap">
@@ -752,7 +1038,7 @@ function HistoryTable({ history, configs, compact = false, onDownload }: { histo
               <td>{row.triggered_by}</td>
               <td>{formatBytes(row.file_size)}</td>
               <td>{new Date(row.started_at).toLocaleString()}</td>
-              {!compact && <td>{row.status === 'success' && <button onClick={() => onDownload?.(row.id)}>下載</button>}</td>}
+              {!compact && <td><div className="history-actions"><button className="ghost" onClick={() => onInspect?.(row)}>查看流程</button>{row.status === 'success' && <button onClick={() => onDownload?.(row.id)}>下載</button>}</div></td>}
             </tr>
           ))}
         </tbody>
@@ -791,7 +1077,7 @@ function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient;
         <h2>使用者</h2>
         <table>
           <thead><tr><th>帳號</th><th>角色</th><th>操作</th></tr></thead>
-          <tbody>{users.map((item) => <tr key={item.id}><td>{item.username}</td><td>{item.role}</td><td>{item.id !== currentUser.id && <button className="danger" onClick={() => api.deleteUser(item.id).then(refresh).catch((err) => setError(err.message))}>刪除</button>}</td></tr>)}</tbody>
+          <tbody>{users.map((item) => <tr key={item.id}><td>{item.username}</td><td>{item.role}</td><td>{item.id !== currentUser.id && <button className="danger" onClick={() => api.deleteUser(item.id).then(() => refresh()).catch((err) => setError(err.message))}>刪除</button>}</td></tr>)}</tbody>
         </table>
       </div>
     </section>

@@ -34,6 +34,27 @@ export type BackupHistory = {
   triggered_by: string;
 };
 
+export type BackupEvent = {
+  id: string;
+  history_id: string;
+  sequence: number;
+  stage: string;
+  level: 'info' | 'success' | 'warning' | 'error';
+  message: string;
+  created_at: string;
+};
+
+export type RunningBackup = {
+  history: BackupHistory;
+  config: {
+    id: string;
+    name: string;
+    db_type: 'postgres' | 'mysql';
+    db_version: string | null;
+  };
+  events: BackupEvent[];
+};
+
 export type DashboardStats = {
   total_configs: number;
   total_backups: number;
@@ -135,6 +156,21 @@ export class ApiClient {
     });
     const suffix = search.size > 0 ? `?${search.toString()}` : '';
     return this.requestEnvelope<HistoryEnvelope>(`/backup-history${suffix}`);
+  }
+
+  historyItem(id: string) {
+    return this.request<BackupHistory>(`/backup-history/${id}`);
+  }
+
+  runningBackups() {
+    return this.request<RunningBackup[]>('/backup-events/running');
+  }
+
+  backupEvents(historyId: string, afterSequence?: number) {
+    const search = new URLSearchParams();
+    if (afterSequence !== undefined) search.set('after_sequence', String(afterSequence));
+    const suffix = search.size > 0 ? `?${search.toString()}` : '';
+    return this.request<BackupEvent[]>(`/backup-events/${historyId}${suffix}`);
   }
 
   users() {

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backups;
 pub mod dashboard;
+pub mod events;
 pub mod history;
 pub mod users;
 
@@ -15,6 +16,7 @@ pub fn router(_state: AppState) -> Router<AppState> {
         .nest("/auth", auth::router())
         .nest("/users", users::router())
         .nest("/backup-configs", backups::router())
+        .nest("/backup-events", events::router())
         .nest("/backup-history", history::router())
         .nest("/dashboard", dashboard::router())
 }
