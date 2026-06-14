@@ -1,0 +1,228 @@
+{
+  "app": {
+    "name": "DumplySquirrel",
+    "subtitle": "Backup Management System"
+  },
+  "nav": {
+    "dashboard": "Dashboard",
+    "configs": "Configs",
+    "history": "History",
+    "users": "Users",
+    "logout": "Logout"
+  },
+  "topbar": {
+    "refresh": "Refresh",
+    "syncing": "Syncing data...",
+    "synced": "System status synced"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "totalTasks": "Tasks",
+    "totalBackups": "Backups",
+    "success": "Success",
+    "failed": "Failed",
+    "storage": "Storage",
+    "recentBackups": "Recent Backups"
+  },
+  "configs": {
+    "title": "Backup Configs",
+    "description": "Manage your database backup tasks. Each config corresponds to a database connection and schedule.",
+    "searchPlaceholder": "Search name or connection URL...",
+    "filterAll": "All",
+    "addDatabase": "Add Database",
+    "columns": {
+      "name": "Name",
+      "type": "Type",
+      "version": "Version",
+      "schedule": "Schedule",
+      "retention": "Retention",
+      "status": "Status"
+    },
+    "actions": {
+      "history": "History",
+      "backup": "Backup",
+      "backupRunning": "Running",
+      "disable": "Disable",
+      "enable": "Enable",
+      "edit": "Edit",
+      "delete": "Delete"
+    },
+    "empty": {
+      "title": "No backup configs yet",
+      "description": "Add your first database backup task, set a schedule and the system will execute automatically."
+    },
+    "emptySearch": {
+      "title": "No matching configs found",
+      "description": "Try adjusting your search or filter criteria."
+    },
+    "form": {
+      "createTitle": "Create Backup Config",
+      "editTitle": "Edit Backup Config",
+      "name": "Name",
+      "dbType": "Database Type",
+      "dbVersion": "Dump Version",
+      "dbUrl": "DB URL",
+      "dbUrlPlaceholder": "postgres://user:pass@host:5432/db",
+      "schedule": "Auto Backup Schedule",
+      "scheduleDescription": "Periodic auto backup is configured.",
+      "scheduleManual": "Will not auto-execute. You can only trigger manually.",
+      "setSchedule": "Set Schedule",
+      "retentionDays": "Retention Days",
+      "timeoutSeconds": "Timeout Seconds",
+      "maxBackups": "Max Backups",
+      "enableSchedule": "Enable Schedule",
+      "editNote": "Updating config requires re-entering the full DB URL. The API does not return the full connection string.",
+      "cancel": "Cancel",
+      "create": "Create Config",
+      "update": "Update Config"
+    },
+    "schedule": {
+      "title": "Set Auto Backup Schedule",
+      "description": "Choose period and time, or switch to custom cron. Actual execution times are shown below.",
+      "type": "Schedule Type",
+      "typeManual": "Manual (no auto backup)",
+      "typeMinute": "Every few minutes",
+      "typeHour": "Every few hours",
+      "typeDaily": "Daily",
+      "typeWeekly": "Weekly",
+      "typeMonthly": "Monthly",
+      "typeYearly": "Yearly",
+      "typeCustom": "Custom cron",
+      "everyMinutes": "Every {interval} minutes",
+      "everyHours": "Every {interval} hours",
+      "startFromMinute": "Start from minute",
+      "startTime": "Start Time",
+      "weekdays": "Execute on weekdays",
+      "monthDay": "Execute on day of month",
+      "yearMonth": "Execute in month",
+      "yearDay": "Execute on day",
+      "customCron": "Custom cron",
+      "preview": "Schedule Preview",
+      "previewStart": "start",
+      "previewManual": "Manual (no auto backup)",
+      "apply": "Apply Schedule"
+    },
+    "delete": {
+      "title": "Delete backup config?",
+      "description": "This will delete the config \"{name}\". Automatic backups will no longer follow this schedule.",
+      "cancel": "Cancel",
+      "confirm": "Confirm Delete"
+    }
+  },
+  "history": {
+    "title": "History",
+    "descriptionAll": "Running backups appear in the same table. Click \"View Flow\" to open Run Room details.",
+    "descriptionFiltered": "Currently showing only backups for \"{name}\".",
+    "viewAll": "View All History",
+    "viewFlow": "View Flow",
+    "download": "Download",
+    "empty": "No records yet",
+    "columns": {
+      "task": "Task",
+      "status": "Status",
+      "trigger": "Trigger",
+      "size": "Size",
+      "started": "Started",
+      "actions": "Actions"
+    },
+    "pagination": {
+      "prev": "Previous",
+      "next": "Next",
+      "page": "Page {page}"
+    },
+    "detail": {
+      "breadcrumb": "History path",
+      "back": "← Back to History",
+      "kicker": "Backup Execution Details",
+      "runningDescription": "This backup is running. Events update every 2 seconds.",
+      "completedDescription": "This is the process and event log left by this backup.",
+      "status": "Status",
+      "stage": "Stage",
+      "duration": "Elapsed",
+      "completedDuration": "Duration",
+      "trigger": "Trigger",
+      "eventsTitle": "Event Log",
+      "eventsLoading": "Loading events",
+      "noEvents": "No running backups yet. Events will appear here line by line after starting a task.",
+      "waitingEvents": "Backup created, waiting for first event.",
+      "polling": "polling 2s"
+    }
+  },
+  "users": {
+    "title": "Users",
+    "createAdmin": "Create Admin",
+    "username": "Username",
+    "password": "Password",
+    "create": "Create User",
+    "columns": {
+      "username": "Username",
+      "role": "Role",
+      "actions": "Actions"
+    },
+    "delete": "Delete"
+  },
+  "login": {
+    "title": "Login to Backup Console",
+    "username": "Username",
+    "password": "Password",
+    "submit": "Login",
+    "loading": "Logging in...",
+    "error": "Login failed"
+  },
+  "status": {
+    "enabled": "enabled",
+    "disabled": "disabled",
+    "running": "running",
+    "success": "success",
+    "failed": "failed",
+    "timeout": "timeout"
+  },
+  "dbType": {
+    "postgres": "PostgreSQL",
+    "mysql": "MySQL",
+    "pg": "PG",
+    "my": "MY"
+  },
+  "scheduleSummary": {
+    "manual": "Manual (no auto backup)",
+    "start": "start"
+  },
+  "cron": {
+    "everyMinutes": "Every {interval} minutes",
+    "everyHoursAtMinute": "Every {interval} hours at minute {minute}",
+    "hourlyAtMinute": "Every hour at minute {minute}",
+    "dailyAt": "Daily at {time}",
+    "weeklyAt": "Weekly on {days} at {time}",
+    "monthlyAt": "Monthly on day {day} at {time}",
+    "yearlyAt": "Yearly on {month}/{day} at {time}",
+    "weekdaySeparator": ", "
+  },
+  "units": {
+    "days": "days",
+    "hours": "h",
+    "minutes": "m"
+  },
+  "weekdays": {
+    "sunday": "Sun",
+    "monday": "Mon",
+    "tuesday": "Tue",
+    "wednesday": "Wed",
+    "thursday": "Thu",
+    "friday": "Fri",
+    "saturday": "Sat"
+  },
+  "mysql": {
+    "note": "MySQL uses system mysqldump. Version option is for display purposes only."
+  },
+  "error": {
+    "loadFailed": "Failed to load",
+    "loadHistoryFailed": "Failed to load history",
+    "createConfigFailed": "Failed to save config",
+    "deleteConfigFailed": "Failed to delete config",
+    "toggleStatusFailed": "Failed to toggle status",
+    "triggerBackupFailed": "Failed to trigger backup",
+    "createUserFailed": "Failed to create user",
+    "deleteUserFailed": "Failed to delete user",
+    "loadEventsFailed": "Failed to load events"
+  }
+}

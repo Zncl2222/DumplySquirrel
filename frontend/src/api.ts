@@ -249,7 +249,18 @@ async function responseError(response: Response) {
   }
 }
 
+type Translate = (key: string, params?: Record<string, string | number>) => string;
+
 const WEEKDAY_NAMES = ['日', '一', '二', '三', '四', '五', '六'];
+const WEEKDAY_KEYS = [
+  'weekdays.sunday',
+  'weekdays.monday',
+  'weekdays.tuesday',
+  'weekdays.wednesday',
+  'weekdays.thursday',
+  'weekdays.friday',
+  'weekdays.saturday',
+];
 
 function expandRange(field: string): string[] {
   const result: string[] = [];
@@ -266,7 +277,7 @@ function expandRange(field: string): string[] {
   return result;
 }
 
-export function cronToHuman(expr: string | null | undefined): string {
+export function cronToHuman(expr: string | null | undefined, t?: Translate): string {
   if (!expr) return '';
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 6) return expr;
@@ -289,32 +300,36 @@ export function cronToHuman(expr: string | null | undefined): string {
 
   // Every N minutes
   if (minInterval && hourAll && dayAll && monthAll && weekdayAll) {
-    return `每 ${minInterval} 分鐘`;
+    return t ? t('cron.everyMinutes', { interval: minInterval }) : `每 ${minInterval} 分鐘`;
   }
   // Every N hours
   if (isPlainNumber(min) && hourInterval && dayAll && monthAll && weekdayAll) {
-    return `每 ${hourInterval} 小時的 ${fmt(min)} 分`;
+    return t ? t('cron.everyHoursAtMinute', { interval: hourInterval, minute: fmt(min) }) : `每 ${hourInterval} 小時的 ${fmt(min)} 分`;
   }
   // Specific minute every hour
   if (isPlainNumber(min) && hourAll && dayAll && monthAll && weekdayAll) {
-    return `每小時 ${fmt(min)} 分`;
+    return t ? t('cron.hourlyAtMinute', { minute: fmt(min) }) : `每小時 ${fmt(min)} 分`;
   }
   // Daily: specific hour + minute
   if (isPlainNumber(min) && isPlainNumber(hour) && dayAll && monthAll && weekdayAll) {
-    return `每天 ${fmt(hour)}:${fmt(min)}`;
+    return t ? t('cron.dailyAt', { time: `${fmt(hour)}:${fmt(min)}` }) : `每天 ${fmt(hour)}:${fmt(min)}`;
   }
   // Weekly: specific weekday(s)
   if (isPlainNumber(min) && isPlainNumber(hour) && !weekdayAll && dayAll && monthAll) {
-    const days = expandRange(weekday).map(d => WEEKDAY_NAMES[parseInt(d, 10)] ?? d);
-    return `每週${days.join('、')} ${fmt(hour)}:${fmt(min)}`;
+    const days = expandRange(weekday).map((d) => {
+      const index = parseInt(d, 10);
+      const weekdayKey = WEEKDAY_KEYS[index];
+      return t && weekdayKey ? t(weekdayKey) : WEEKDAY_NAMES[index] ?? d;
+    });
+    return t ? t('cron.weeklyAt', { days: days.join(t('cron.weekdaySeparator')), time: `${fmt(hour)}:${fmt(min)}` }) : `每週${days.join('、')} ${fmt(hour)}:${fmt(min)}`;
   }
   // Monthly: specific day of month
   if (isPlainNumber(min) && isPlainNumber(hour) && !dayAll && monthAll && weekdayAll) {
-    return `每月 ${day} 日 ${fmt(hour)}:${fmt(min)}`;
+    return t ? t('cron.monthlyAt', { day, time: `${fmt(hour)}:${fmt(min)}` }) : `每月 ${day} 日 ${fmt(hour)}:${fmt(min)}`;
   }
   // Yearly: specific month + day
   if (isPlainNumber(min) && isPlainNumber(hour) && !dayAll && !monthAll && weekdayAll) {
-    return `每年 ${month} 月 ${day} 日 ${fmt(hour)}:${fmt(min)}`;
+    return t ? t('cron.yearlyAt', { month, day, time: `${fmt(hour)}:${fmt(min)}` }) : `每年 ${month} 月 ${day} 日 ${fmt(hour)}:${fmt(min)}`;
   }
 
   return expr;

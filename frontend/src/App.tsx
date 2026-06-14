@@ -11,6 +11,8 @@ import {
   cronToHuman,
   formatBytes,
 } from './api';
+import { useLanguage } from './i18n';
+import { LanguageSwitcher } from './components/LanguageSwitcher';
 
 type Tab = 'dashboard' | 'configs' | 'history' | 'users';
 
@@ -56,15 +58,17 @@ type ScheduleDraft = {
   cron: string;
 };
 
-const weekdayOptions = [
-  { value: '0', label: '週日' },
-  { value: '1', label: '週一' },
-  { value: '2', label: '週二' },
-  { value: '3', label: '週三' },
-  { value: '4', label: '週四' },
-  { value: '5', label: '週五' },
-  { value: '6', label: '週六' },
-];
+function getWeekdayOptions(t: (key: string) => string) {
+  return [
+    { value: '0', label: t('weekdays.sunday') },
+    { value: '1', label: t('weekdays.monday') },
+    { value: '2', label: t('weekdays.tuesday') },
+    { value: '3', label: t('weekdays.wednesday') },
+    { value: '4', label: t('weekdays.thursday') },
+    { value: '5', label: t('weekdays.friday') },
+    { value: '6', label: t('weekdays.saturday') },
+  ];
+}
 
 const dayOptions = Array.from({ length: 31 }, (_, index) => String(index + 1));
 const hourOptions = Array.from({ length: 24 }, (_, index) => String(index));
@@ -154,11 +158,12 @@ function cronFromScheduleDraft(draft: ScheduleDraft) {
   return draft.cron.trim();
 }
 
-function scheduleSummary(schedule: string) {
-  return schedule ? `${cronToHuman(schedule)} 開始` : '手動（不自動備份）';
+function scheduleSummary(schedule: string, t: (key: string) => string) {
+  return schedule ? `${cronToHuman(schedule, t)} ${t('scheduleSummary.start')}` : t('scheduleSummary.manual');
 }
 
 export function App() {
+  const { t } = useLanguage();
   const [token, setToken] = useState(() => localStorage.getItem('dumply_token'));
   const [api] = useState(() => new ApiClient(token));
   const [user, setUser] = useState<User | null>(null);
@@ -238,7 +243,7 @@ export function App() {
       setHistoryHasNext(backupHistory.pagination.has_next);
       setUsers(userList);
     } catch (err) {
-      const message = err instanceof Error ? err.message : '載入失敗';
+      const message = err instanceof Error ? err.message : t('error.loadFailed');
       setError(message);
       if (message.includes('unauthorized')) {
         setToken(null);
@@ -274,7 +279,7 @@ export function App() {
       setHistoryPage(response.pagination.page);
       setHistoryHasNext(response.pagination.has_next);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '載入歷史記錄失敗');
+      setError(err instanceof Error ? err.message : t('error.loadHistoryFailed'));
     } finally {
       setLoading(false);
     }
@@ -317,28 +322,31 @@ export function App() {
           />
           <div>
             <div className="brand">DumplySquirrel</div>
-            <p className="muted">備份管理系統</p>
+            <p className="muted">{t('app.subtitle')}</p>
           </div>
         </div>
         <nav>
-          <button className={tab === 'dashboard' ? 'active' : ''} onClick={openDashboard}>Dashboard</button>
-          <button className={tab === 'configs' ? 'active' : ''} onClick={() => setTab('configs')}>備份設定</button>
-          <button className={tab === 'history' ? 'active' : ''} onClick={openAllHistory}>歷史記錄</button>
-          <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>使用者</button>
+          <button className={tab === 'dashboard' ? 'active' : ''} onClick={openDashboard}>{t('nav.dashboard')}</button>
+          <button className={tab === 'configs' ? 'active' : ''} onClick={() => setTab('configs')}>{t('nav.configs')}</button>
+          <button className={tab === 'history' ? 'active' : ''} onClick={openAllHistory}>{t('nav.history')}</button>
+          <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>{t('nav.users')}</button>
         </nav>
         <div className="sidebar-footer">
           <span>{user.username}</span>
-          <button className="ghost" onClick={logout}>登出</button>
+          <button className="ghost" onClick={logout}>{t('nav.logout')}</button>
         </div>
       </aside>
 
       <main className="main">
         <header className="topbar">
           <div>
-            <h1>{tabTitle(tab)}</h1>
-            <p className="muted">{loading ? '同步資料中...' : '系統狀態已同步'}</p>
+            <h1>{tabTitle(tab, t)}</h1>
+            <p className="muted">{loading ? t('topbar.syncing') : t('topbar.synced')}</p>
           </div>
-          <button onClick={() => void refreshAll()}>重新整理</button>
+          <div className="topbar-actions">
+            <LanguageSwitcher />
+            <button onClick={() => void refreshAll()}>{t('topbar.refresh')}</button>
+          </div>
         </header>
         {error && <div className="alert">{error}</div>}
         {tab === 'dashboard' && <Dashboard stats={stats} configs={configs} history={history} />}
@@ -351,6 +359,7 @@ export function App() {
 }
 
 function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin: (token: string) => void; error: string | null; setError: (error: string | null) => void }) {
+  const { t } = useLanguage();
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
@@ -363,7 +372,7 @@ function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin:
       const response = await api.login(username, password);
       onLogin(response.token);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '登入失敗');
+      setError(err instanceof Error ? err.message : t('login.error'));
     } finally {
       setLoading(false);
     }
@@ -374,14 +383,14 @@ function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin:
       <section className="login-card">
         <div className="login-brand">
           <img className="brand-icon" src="/assets/dumply-squirrel-icon.png" alt="" aria-hidden="true" draggable="false" />
-          <p className="eyebrow">DumplySquirrel</p>
+          <p className="eyebrow">{t('app.name')}</p>
         </div>
-        <h1>登入備份管理台</h1>
+        <h1>{t('login.title')}</h1>
         <form onSubmit={submit}>
-          <label>帳號<input value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-          <label>密碼<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          <label>{t('login.username')}<input value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+          <label>{t('login.password')}<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
           {error && <div className="alert">{error}</div>}
-          <button disabled={loading}>{loading ? '登入中...' : '登入'}</button>
+          <button disabled={loading}>{loading ? t('login.loading') : t('login.submit')}</button>
         </form>
       </section>
     </main>
@@ -389,16 +398,17 @@ function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin:
 }
 
 function Dashboard({ stats, configs, history }: { stats: DashboardStats | null; configs: BackupConfig[]; history: BackupHistory[] }) {
+  const { t } = useLanguage();
   const latest = history.slice(0, 6);
   return (
     <section className="grid">
-      <Metric title="任務數" value={stats?.total_configs ?? configs.length} />
-      <Metric title="備份次數" value={stats?.total_backups ?? history.length} />
-      <Metric title="成功" value={stats?.success_count ?? 0} />
-      <Metric title="失敗" value={stats?.failed_count ?? 0} />
-      <Metric title="儲存用量" value={formatBytes(stats?.storage_bytes)} />
+      <Metric title={t('dashboard.totalTasks')} value={stats?.total_configs ?? configs.length} />
+      <Metric title={t('dashboard.totalBackups')} value={stats?.total_backups ?? history.length} />
+      <Metric title={t('dashboard.success')} value={stats?.success_count ?? 0} />
+      <Metric title={t('dashboard.failed')} value={stats?.failed_count ?? 0} />
+      <Metric title={t('dashboard.storage')} value={formatBytes(stats?.storage_bytes)} />
       <div className="panel wide">
-        <h2>最近備份</h2>
+        <h2>{t('dashboard.recentBackups')}</h2>
         <HistoryTable history={latest} configs={configs} compact />
       </div>
     </section>
@@ -421,14 +431,15 @@ const runStages = [
 ];
 
 function RunRoomDetail({ history, configName, events, loading, onBack }: { history: BackupHistory; configName: string; events: BackupEvent[]; loading: boolean; onBack: () => void }) {
+  const { t } = useLanguage();
   const currentStage = stageFromEvents(events, history.status);
   const isRunning = history.status === 'running';
   const startedAt = new Date(history.started_at).toLocaleString();
 
   return (
     <section className="run-detail-panel" aria-labelledby="run-detail-title">
-      <nav className="run-breadcrumb" aria-label="歷史記錄路徑">
-        <span>歷史記錄</span>
+      <nav className="run-breadcrumb" aria-label={t('history.detail.breadcrumb')}>
+        <span>{t('nav.history')}</span>
         <span aria-hidden="true">/</span>
         <span>{configName}</span>
         <span aria-hidden="true">/</span>
@@ -437,29 +448,29 @@ function RunRoomDetail({ history, configName, events, loading, onBack }: { histo
 
       <header className="run-detail-heading">
         <div className="run-detail-title">
-          <button className="run-back" onClick={onBack}>← 返回歷史記錄</button>
-          <p className="run-kicker">備份執行詳情</p>
+          <button className="run-back" onClick={onBack}>{t('history.detail.back')}</button>
+          <p className="run-kicker">{t('history.detail.kicker')}</p>
           <h2 id="run-detail-title">{configName}</h2>
-          <p>{isRunning ? '這筆備份正在執行，事件會每 2 秒更新。' : '這是該筆備份留下的流程與事件紀錄。'}</p>
+          <p>{isRunning ? t('history.detail.runningDescription') : t('history.detail.completedDescription')}</p>
         </div>
         <div className="run-detail-badges">
           <StatusBadge status={history.status} />
-          {isRunning && <span className="run-polling">polling 2s</span>}
+          {isRunning && <span className="run-polling">{t('history.detail.polling')}</span>}
         </div>
       </header>
 
       <div className="run-facts">
-        <RunFact label="狀態" value={history.status} />
-        <RunFact label="階段" value={stageLabel(currentStage)} />
-        <RunFact label={isRunning ? '已執行' : '耗時'} value={runDuration(history)} />
-        <RunFact label="觸發" value={history.triggered_by} />
+        <RunFact label={t('history.detail.status')} value={history.status} />
+        <RunFact label={t('history.detail.stage')} value={stageLabel(currentStage)} />
+        <RunFact label={isRunning ? t('history.detail.duration') : t('history.detail.completedDuration')} value={runDuration(history)} />
+        <RunFact label={t('history.detail.trigger')} value={history.triggered_by} />
       </div>
 
-      <main className="run-log-panel" aria-label="備份事件 log">
+      <main className="run-log-panel" aria-label={t('history.detail.eventsTitle')}>
         <div className="run-log-head">
           <div>
-            <p className="run-kicker">事件紀錄</p>
-            <h2>{loading ? '載入事件中' : '事件紀錄'}</h2>
+            <p className="run-kicker">{loading ? t('history.detail.eventsLoading') : t('history.detail.eventsTitle')}</p>
+            <h2>{t('history.detail.eventsTitle')}</h2>
           </div>
         </div>
         <RunLog events={events} history={history} />
@@ -473,8 +484,9 @@ function RunFact({ label, value }: { label: string; value: string }) {
 }
 
 function RunLog({ events, history }: { events: BackupEvent[]; history: BackupHistory | null }) {
+  const { t } = useLanguage();
   if (!history) {
-    return <div className="run-log-empty">還沒有正在執行的備份。啟動任務後，事件會在這裡逐行出現。</div>;
+    return <div className="run-log-empty">{t('history.detail.noEvents')}</div>;
   }
 
   return (
@@ -485,7 +497,7 @@ function RunLog({ events, history }: { events: BackupEvent[]; history: BackupHis
           <span className="run-log-stage">{event.stage}</span>
           <span>{event.message}</span>
         </div>
-      )) : <div className="run-log-empty">備份已建立，正在等待第一筆事件。</div>}
+      )) : <div className="run-log-empty">{t('history.detail.waitingEvents')}</div>}
       {history.error_message && <div className="run-log-error">{history.error_message}</div>}
     </div>
   );
@@ -539,6 +551,7 @@ function dbVersionOptions(dbType: 'postgres' | 'mysql') {
 }
 
 function Configs({ api, configs, runningBackups, refresh, setError, onViewHistory, onBackupStarted }: { api: ApiClient; configs: BackupConfig[]; runningBackups: RunningBackup[]; refresh: (options?: RefreshOptions) => Promise<void>; setError: (error: string | null) => void; onViewHistory: (config: BackupConfig) => void; onBackupStarted: (history: BackupHistory) => void }) {
+  const { t } = useLanguage();
   const [form, setForm] = useState(emptyConfigForm);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
@@ -617,7 +630,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
       setShowPanel(false);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '儲存設定失敗');
+      setError(err instanceof Error ? err.message : t('error.createConfigFailed'));
     }
   }
 
@@ -656,7 +669,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
       setDeleteTarget(null);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '刪除設定失敗');
+      setError(err instanceof Error ? err.message : t('error.deleteConfigFailed'));
     }
   }
 
@@ -667,7 +680,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
       onBackupStarted(row);
       await refresh({ historyConfigId: row.config_id, historyPage: 1 });
     } catch (err) {
-      setError(err instanceof Error ? err.message : '啟動備份失敗');
+      setError(err instanceof Error ? err.message : t('error.triggerBackupFailed'));
     }
   }
 
@@ -676,28 +689,28 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
       await api.toggleConfig(config.id, !config.is_enabled);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '切換狀態失敗');
+      setError(err instanceof Error ? err.message : t('error.toggleStatusFailed'));
     }
   }, [api, refresh, setError]);
 
   return (
     <section className="configs-page">
       <div className="config-header">
-        <h2>備份設定</h2>
-        <p>管理你的資料庫備份任務。每個設定對應一個資料庫連線與排程。</p>
+        <h2>{t('configs.title')}</h2>
+        <p>{t('configs.description')}</p>
       </div>
 
       <div className="config-toolbar">
         <div className="config-search">
-          <input placeholder="搜尋名稱或連線位址..." value={search} onChange={(e) => setSearch(e.target.value)} />
+          <input placeholder={t('configs.searchPlaceholder')} value={search} onChange={(e) => setSearch(e.target.value)} />
         </div>
         <div className="config-filters">
-          <button className={`config-type-btn type-all ${typeFilter === 'all' ? 'active' : ''}`} onClick={() => setTypeFilter('all')}>全部</button>
+          <button className={`config-type-btn type-all ${typeFilter === 'all' ? 'active' : ''}`} onClick={() => setTypeFilter('all')}>{t('configs.filterAll')}</button>
           <button className={`config-type-btn type-postgres ${typeFilter === 'postgres' ? 'active' : ''}`} onClick={() => setTypeFilter('postgres')}>PostgreSQL</button>
           <button className={`config-type-btn type-mysql ${typeFilter === 'mysql' ? 'active' : ''}`} onClick={() => setTypeFilter('mysql')}>MySQL</button>
         </div>
         <span className="config-count">{filtered.length} / {configs.length}</span>
-        <button onClick={openCreate}>新增資料庫</button>
+        <button onClick={openCreate}>{t('configs.addDatabase')}</button>
       </div>
 
       {filtered.length > 0 ? (
@@ -706,12 +719,12 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
             <table className="config-table">
               <thead>
                 <tr>
-                  <th>名稱</th>
-                  <th>類型</th>
-                  <th>版本</th>
-                  <th>排程</th>
-                  <th>保留</th>
-                  <th>狀態</th>
+                  <th>{t('configs.columns.name')}</th>
+                  <th>{t('configs.columns.type')}</th>
+                  <th>{t('configs.columns.version')}</th>
+                  <th>{t('configs.columns.schedule')}</th>
+                  <th>{t('configs.columns.retention')}</th>
+                  <th>{t('configs.columns.status')}</th>
                   <th></th>
                 </tr>
               </thead>
@@ -729,18 +742,18 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
                     </td>
                     <td className="config-retention">{config.db_version ?? 'Auto'}</td>
                     <td className="config-schedule">
-                      {scheduleSummary(config.cron_schedule ?? '')}
+                      {scheduleSummary(config.cron_schedule ?? '', t)}
                       {config.cron_schedule && <code title={config.cron_schedule}>{config.cron_schedule}</code>}
                     </td>
-                    <td className="config-retention">{config.retention_days} 天</td>
+                    <td className="config-retention">{config.retention_days} {t('units.days')}</td>
                     <td><StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} /></td>
                     <td>
                       <div className="config-actions">
-                        <button className="ghost" onClick={() => onViewHistory(config)}>歷史</button>
-                        <button className={`ghost backup-trigger ${runningConfigIds.has(config.id) ? 'running' : ''}`} disabled={runningConfigIds.has(config.id)} onClick={() => void triggerBackup(config)}>{runningConfigIds.has(config.id) ? '備份中' : '備份'}</button>
-                        <button className="ghost" onClick={() => void handleToggleConfig(config)}>{config.is_enabled ? '停用' : '啟用'}</button>
-                        <button className="ghost" onClick={() => openEdit(config)}>編輯</button>
-                        <button className="danger" onClick={() => setDeleteTarget(config)}>刪除</button>
+                        <button className="ghost" onClick={() => onViewHistory(config)}>{t('configs.actions.history')}</button>
+                        <button className={`ghost backup-trigger ${runningConfigIds.has(config.id) ? 'running' : ''}`} disabled={runningConfigIds.has(config.id)} onClick={() => void triggerBackup(config)}>{runningConfigIds.has(config.id) ? t('configs.actions.backupRunning') : t('configs.actions.backup')}</button>
+                        <button className="ghost" onClick={() => void handleToggleConfig(config)}>{config.is_enabled ? t('configs.actions.disable') : t('configs.actions.enable')}</button>
+                        <button className="ghost" onClick={() => openEdit(config)}>{t('configs.actions.edit')}</button>
+                        <button className="danger" onClick={() => setDeleteTarget(config)}>{t('configs.actions.delete')}</button>
                       </div>
                     </td>
                   </tr>
@@ -751,43 +764,43 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
         </div>
       ) : (
         <div className="config-empty">
-          <h3>{search || typeFilter !== 'all' ? '找不到符合的設定' : '還沒有備份設定'}</h3>
-          <p>{search || typeFilter !== 'all' ? '嘗試調整搜尋條件或篩選器。' : '新增你的第一個資料庫備份任務，設定排程後系統會自動執行。'}</p>
-          {!search && typeFilter === 'all' && <button onClick={openCreate}>新增資料庫</button>}
+          <h3>{search || typeFilter !== 'all' ? t('configs.emptySearch.title') : t('configs.empty.title')}</h3>
+          <p>{search || typeFilter !== 'all' ? t('configs.emptySearch.description') : t('configs.empty.description')}</p>
+          {!search && typeFilter === 'all' && <button onClick={openCreate}>{t('configs.addDatabase')}</button>}
         </div>
       )}
 
       {showPanel && (
         <>
           <div className="config-overlay" onClick={closePanel} />
-          <div className="config-panel" ref={panelRef} role="dialog" aria-label={editingId ? '編輯備份設定' : '新增備份設定'}>
+          <div className="config-panel" ref={panelRef} role="dialog" aria-label={editingId ? t('configs.form.editTitle') : t('configs.form.createTitle')}>
             <div className="config-panel-header">
-              <h2>{editingId ? '編輯備份設定' : '新增備份設定'}</h2>
-              <button className="config-panel-close" onClick={closePanel} aria-label="關閉">✕</button>
+              <h2>{editingId ? t('configs.form.editTitle') : t('configs.form.createTitle')}</h2>
+              <button className="config-panel-close" onClick={closePanel} aria-label="Close">✕</button>
             </div>
             <form ref={panelFormRef} className="config-panel-body form" onSubmit={submit}>
-              {editingId && <p className="panel-note">更新設定需要重新輸入完整 DB URL，API 不會回傳完整連線字串。</p>}
-              <label>名稱<input required value={form.name} onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))} /></label>
-              <label>資料庫類型<select value={form.db_type} onChange={(e) => setForm((prev) => ({ ...prev, db_type: e.target.value as 'postgres' | 'mysql', db_version: '' }))}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
-              <label>Dump 版本<select value={form.db_version} onChange={(e) => setForm((prev) => ({ ...prev, db_version: e.target.value }))}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-              {form.db_type === 'mysql' && <p className="muted">MySQL 目前使用系統 mysqldump；版本選項只作為設定標示用途。</p>}
-              <label>DB URL<input required placeholder="postgres://user:pass@host:5432/db" value={form.db_url} onChange={(e) => setForm((prev) => ({ ...prev, db_url: e.target.value }))} /></label>
+              {editingId && <p className="panel-note">{t('configs.form.editNote')}</p>}
+              <label>{t('configs.form.name')}<input required value={form.name} onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))} /></label>
+              <label>{t('configs.form.dbType')}<select value={form.db_type} onChange={(e) => setForm((prev) => ({ ...prev, db_type: e.target.value as 'postgres' | 'mysql', db_version: '' }))}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
+              <label>{t('configs.form.dbVersion')}<select value={form.db_version} onChange={(e) => setForm((prev) => ({ ...prev, db_version: e.target.value }))}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+              {form.db_type === 'mysql' && <p className="muted">{t('mysql.note')}</p>}
+              <label>{t('configs.form.dbUrl')}<input required placeholder={t('configs.form.dbUrlPlaceholder')} value={form.db_url} onChange={(e) => setForm((prev) => ({ ...prev, db_url: e.target.value }))} /></label>
               <div className="schedule-summary">
-                <span>自動備份排程</span>
-                <strong>{scheduleSummary(form.cron_schedule)}</strong>
-                <p className="muted">{form.cron_schedule ? '已設定週期性自動備份。' : '不會自動執行，只能手動點「立即備份」。'}</p>
-                <button type="button" onClick={() => setScheduleDialogOpen(true)}>設定排程</button>
+                <span>{t('configs.form.schedule')}</span>
+                <strong>{scheduleSummary(form.cron_schedule, t)}</strong>
+                <p className="muted">{form.cron_schedule ? t('configs.form.scheduleDescription') : t('configs.form.scheduleManual')}</p>
+                <button type="button" onClick={() => setScheduleDialogOpen(true)}>{t('configs.form.setSchedule')}</button>
               </div>
               <div className="form-row">
-                <label>保留天數<input type="number" min="1" value={form.retention_days} onChange={(e) => setForm((prev) => ({ ...prev, retention_days: Number(e.target.value) }))} /></label>
-                <label>Timeout 秒<input type="number" min="1" value={form.timeout_seconds} onChange={(e) => setForm((prev) => ({ ...prev, timeout_seconds: Number(e.target.value) }))} /></label>
+                <label>{t('configs.form.retentionDays')}<input type="number" min="1" value={form.retention_days} onChange={(e) => setForm((prev) => ({ ...prev, retention_days: Number(e.target.value) }))} /></label>
+                <label>{t('configs.form.timeoutSeconds')}<input type="number" min="1" value={form.timeout_seconds} onChange={(e) => setForm((prev) => ({ ...prev, timeout_seconds: Number(e.target.value) }))} /></label>
               </div>
-              <label>最多保留份數<input type="number" min="1" value={form.max_backups} onChange={(e) => setForm((prev) => ({ ...prev, max_backups: e.target.value }))} /></label>
-              <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(e) => setForm((prev) => ({ ...prev, is_enabled: e.target.checked }))} />啟用排程</label>
+              <label>{t('configs.form.maxBackups')}<input type="number" min="1" value={form.max_backups} onChange={(e) => setForm((prev) => ({ ...prev, max_backups: e.target.value }))} /></label>
+              <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(e) => setForm((prev) => ({ ...prev, is_enabled: e.target.checked }))} />{t('configs.form.enableSchedule')}</label>
             </form>
             <div className="config-panel-footer">
-              <button className="ghost" onClick={closePanel}>取消</button>
-              <button onClick={() => panelFormRef.current?.requestSubmit()}>{editingId ? '更新設定' : '建立設定'}</button>
+              <button className="ghost" onClick={closePanel}>{t('configs.form.cancel')}</button>
+              <button onClick={() => panelFormRef.current?.requestSubmit()}>{editingId ? t('configs.form.update') : t('configs.form.create')}</button>
             </div>
           </div>
         </>
@@ -812,10 +825,11 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
 }
 
 function ScheduleModal({ open, value, onApply, onClose }: { open: boolean; value: string; onApply: (schedule: string) => void; onClose: () => void }) {
+  const { t } = useLanguage();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [draft, setDraft] = useState(() => scheduleDraftFromCron(value));
   const cron = cronFromScheduleDraft(draft);
-  const translated = cron ? cronToHuman(cron) : '手動（不自動備份）';
+  const translated = cron ? cronToHuman(cron, t) : t('scheduleSummary.manual');
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -852,40 +866,40 @@ function ScheduleModal({ open, value, onApply, onClose }: { open: boolean; value
       <form className="schedule-form" onSubmit={submit}>
         <div className="modal-heading">
           <div>
-            <h2 id="schedule-dialog-title">設定自動備份排程</h2>
-            <p className="muted">選擇週期與時間，或切到自訂 cron。下方會即時顯示實際執行時間。</p>
+            <h2 id="schedule-dialog-title">{t('configs.schedule.title')}</h2>
+            <p className="muted">{t('configs.schedule.description')}</p>
           </div>
-          <button type="button" className="ghost" onClick={onClose}>關閉</button>
+          <button type="button" className="ghost" onClick={onClose}>{t('configs.form.cancel')}</button>
         </div>
 
-        <label>排程類型<select value={draft.mode} onChange={(event) => updateMode(event.target.value as ScheduleMode)}>
-          <option value="manual">手動（不自動備份）</option>
-          <option value="minute">每幾分鐘</option>
-          <option value="hour">每幾小時</option>
-          <option value="daily">每天</option>
-          <option value="weekly">每週</option>
-          <option value="monthly">每月</option>
-          <option value="yearly">每年</option>
-          <option value="custom">手動輸入 cron</option>
+        <label>{t('configs.schedule.type')}<select value={draft.mode} onChange={(event) => updateMode(event.target.value as ScheduleMode)}>
+          <option value="manual">{t('configs.schedule.typeManual')}</option>
+          <option value="minute">{t('configs.schedule.typeMinute')}</option>
+          <option value="hour">{t('configs.schedule.typeHour')}</option>
+          <option value="daily">{t('configs.schedule.typeDaily')}</option>
+          <option value="weekly">{t('configs.schedule.typeWeekly')}</option>
+          <option value="monthly">{t('configs.schedule.typeMonthly')}</option>
+          <option value="yearly">{t('configs.schedule.typeYearly')}</option>
+          <option value="custom">{t('configs.schedule.typeCustom')}</option>
         </select></label>
 
-        {draft.mode === 'minute' && <label>每幾分鐘執行<select value={draft.minuteInterval} onChange={(event) => setDraft({ ...draft, minuteInterval: event.target.value })}>{intervalOptions.map((option) => <option key={option} value={option}>每 {option} 分鐘</option>)}</select></label>}
-        {draft.mode === 'hour' && <div className="form-row"><label>每幾小時執行<select value={draft.hourInterval} onChange={(event) => setDraft({ ...draft, hourInterval: event.target.value })}>{hourIntervalOptions.map((option) => <option key={option} value={option}>每 {option} 小時</option>)}</select></label><TimeFields time={draft.time} label="從每小時幾分開始" onChange={(time) => setDraft({ ...draft, time })} minuteOnly /></div>}
-        {['daily', 'weekly', 'monthly', 'yearly'].includes(draft.mode) && <TimeFields time={draft.time} label="開始時間" onChange={(time) => setDraft({ ...draft, time })} />}
-        {draft.mode === 'weekly' && <fieldset className="weekday-grid"><legend>星期幾執行</legend>{weekdayOptions.map((option) => <label key={option.value} className="check"><input type="checkbox" checked={draft.weekdays.includes(option.value)} onChange={() => toggleWeekday(option.value)} />{option.label}</label>)}</fieldset>}
-        {draft.mode === 'monthly' && <label>每月幾號執行<select value={draft.monthDay} onChange={(event) => setDraft({ ...draft, monthDay: event.target.value })}>{dayOptions.map((option) => <option key={option} value={option}>{option} 日</option>)}</select></label>}
-        {draft.mode === 'yearly' && <div className="form-row"><label>每年幾月執行<select value={draft.month} onChange={(event) => setDraft({ ...draft, month: event.target.value })}>{monthOptions.map((option) => <option key={option} value={option}>{option} 月</option>)}</select></label><label>幾號執行<select value={draft.monthDay} onChange={(event) => setDraft({ ...draft, monthDay: event.target.value })}>{dayOptions.map((option) => <option key={option} value={option}>{option} 日</option>)}</select></label></div>}
-        {draft.mode === 'custom' && <label>手動輸入 cron<input aria-describedby="schedule-preview" value={draft.cron} onChange={(event) => setDraft({ ...draft, cron: event.target.value })} /></label>}
+        {draft.mode === 'minute' && <label>{t('configs.schedule.everyMinutes', { interval: draft.minuteInterval })}<select value={draft.minuteInterval} onChange={(event) => setDraft({ ...draft, minuteInterval: event.target.value })}>{intervalOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>}
+        {draft.mode === 'hour' && <div className="form-row"><label>{t('configs.schedule.everyHours', { interval: draft.hourInterval })}<select value={draft.hourInterval} onChange={(event) => setDraft({ ...draft, hourInterval: event.target.value })}>{hourIntervalOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label><TimeFields time={draft.time} label={t('configs.schedule.startFromMinute')} onChange={(time) => setDraft({ ...draft, time })} minuteOnly /></div>}
+        {['daily', 'weekly', 'monthly', 'yearly'].includes(draft.mode) && <TimeFields time={draft.time} label={t('configs.schedule.startTime')} onChange={(time) => setDraft({ ...draft, time })} />}
+        {draft.mode === 'weekly' && <fieldset className="weekday-grid"><legend>{t('configs.schedule.weekdays')}</legend>{getWeekdayOptions(t).map((option) => <label key={option.value} className="check"><input type="checkbox" checked={draft.weekdays.includes(option.value)} onChange={() => toggleWeekday(option.value)} />{option.label}</label>)}</fieldset>}
+        {draft.mode === 'monthly' && <label>{t('configs.schedule.monthDay')}<select value={draft.monthDay} onChange={(event) => setDraft({ ...draft, monthDay: event.target.value })}>{dayOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>}
+        {draft.mode === 'yearly' && <div className="form-row"><label>{t('configs.schedule.yearMonth')}<select value={draft.month} onChange={(event) => setDraft({ ...draft, month: event.target.value })}>{monthOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label><label>{t('configs.schedule.yearDay')}<select value={draft.monthDay} onChange={(event) => setDraft({ ...draft, monthDay: event.target.value })}>{dayOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label></div>}
+        {draft.mode === 'custom' && <label>{t('configs.schedule.customCron')}<input aria-describedby="schedule-preview" value={draft.cron} onChange={(event) => setDraft({ ...draft, cron: event.target.value })} /></label>}
 
         <div className="schedule-preview" id="schedule-preview" aria-live="polite">
-          <span>排程預覽</span>
-          <strong>{cron ? `${translated} 開始` : translated}</strong>
+          <span>{t('configs.schedule.preview')}</span>
+          <strong>{cron ? `${translated} ${t('configs.schedule.previewStart')}` : translated}</strong>
           {cron && <code>{cron}</code>}
         </div>
 
         <div className="modal-actions">
-          <button type="button" className="ghost" onClick={onClose}>取消</button>
-          <button type="submit">套用排程</button>
+          <button type="button" className="ghost" onClick={onClose}>{t('configs.form.cancel')}</button>
+          <button type="submit">{t('configs.schedule.apply')}</button>
         </div>
       </form>
     </dialog>
@@ -893,17 +907,19 @@ function ScheduleModal({ open, value, onApply, onClose }: { open: boolean; value
 }
 
 function TimeFields({ time, label, minuteOnly = false, onChange }: { time: string; label: string; minuteOnly?: boolean; onChange: (time: string) => void }) {
+  const { t } = useLanguage();
   const { hour, minute } = timeParts(time);
   return (
     <fieldset className="time-fields">
       <legend>{label}</legend>
-      {!minuteOnly && <label>小時<select value={hour} onChange={(event) => onChange(updateTimePart(time, 'hour', event.target.value))}>{hourOptions.map((option) => <option key={option} value={option}>{option.padStart(2, '0')} 時</option>)}</select></label>}
-      <label>分鐘<select value={minute} onChange={(event) => onChange(updateTimePart(time, 'minute', event.target.value))}>{minuteOptions.map((option) => <option key={option} value={option}>{option.padStart(2, '0')} 分</option>)}</select></label>
+      {!minuteOnly && <label>{t('units.hours')}<select value={hour} onChange={(event) => onChange(updateTimePart(time, 'hour', event.target.value))}>{hourOptions.map((option) => <option key={option} value={option}>{option.padStart(2, '0')}</option>)}</select></label>}
+      <label>{t('units.minutes')}<select value={minute} onChange={(event) => onChange(updateTimePart(time, 'minute', event.target.value))}>{minuteOptions.map((option) => <option key={option} value={option}>{option.padStart(2, '0')}</option>)}</select></label>
     </fieldset>
   );
 }
 
 function DeleteConfigDialog({ config, onCancel, onConfirm }: { config: BackupConfig | null; onCancel: () => void; onConfirm: () => Promise<void> }) {
+  const { t } = useLanguage();
   const dialogRef = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
@@ -922,12 +938,12 @@ function DeleteConfigDialog({ config, onCancel, onConfirm }: { config: BackupCon
     <dialog className="schedule-dialog confirm-dialog" ref={dialogRef} onClose={onCancel} aria-labelledby="delete-config-title">
       <form className="schedule-form" onSubmit={submit}>
         <div>
-          <h2 id="delete-config-title">確定要刪除備份設定？</h2>
-          <p className="muted">這會刪除「{config?.name ?? ''}」的設定，之後不會再依照這個排程自動備份。</p>
+          <h2 id="delete-config-title">{t('configs.delete.title')}</h2>
+          <p className="muted">{t('configs.delete.description', { name: config?.name ?? '' })}</p>
         </div>
         <div className="modal-actions">
-          <button type="button" className="ghost" onClick={onCancel}>取消</button>
-          <button type="submit" className="danger">確認刪除</button>
+          <button type="button" className="ghost" onClick={onCancel}>{t('configs.delete.cancel')}</button>
+          <button type="submit" className="danger">{t('configs.delete.confirm')}</button>
         </div>
       </form>
     </dialog>
@@ -935,6 +951,7 @@ function DeleteConfigDialog({ config, onCancel, onConfirm }: { config: BackupCon
 }
 
 function History({ api, history, runningBackups, focusedHistory, configs, selectedConfigId, page, hasNext, refresh, setError, onPageChange, onShowAll, onFocusedHistoryConsumed }: { api: ApiClient; history: BackupHistory[]; runningBackups: RunningBackup[]; focusedHistory: BackupHistory | null; configs: BackupConfig[]; selectedConfigId: string | null; page: number; hasNext: boolean; refresh: () => Promise<void>; setError: (error: string | null) => void; onPageChange: (page: number) => Promise<void>; onShowAll: () => void; onFocusedHistoryConsumed: () => void }) {
+  const { t } = useLanguage();
   const [selectedHistory, setSelectedHistory] = useState<BackupHistory | null>(null);
   const [selectedEvents, setSelectedEvents] = useState<BackupEvent[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
@@ -975,7 +992,7 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
           if (latestHistory && latestHistory.status !== 'running') setSelectedHistory(latestHistory);
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : '載入流程事件失敗');
+        if (!cancelled) setError(err instanceof Error ? err.message : t('error.loadEventsFailed'));
       } finally {
         if (!cancelled) setEventsLoading(false);
       }
@@ -1022,34 +1039,35 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
     <section className="panel history-panel">
       <div className="panel-heading">
         <div>
-          <h2>歷史記錄</h2>
+          <h2>{t('history.title')}</h2>
           <p className="muted">
             {selectedConfigName
-              ? `目前只顯示「${selectedConfigName}」的每一次備份執行紀錄。`
-              : '正在執行的備份會出現在同一張表；點「查看流程」開啟 Run Room 詳情。'}
+              ? t('history.descriptionFiltered', { name: selectedConfigName })
+              : t('history.descriptionAll')}
           </p>
         </div>
         <div className="actions">
-          {selectedConfigId && <button className="ghost" onClick={onShowAll}>查看全部歷史</button>}
-          <button onClick={() => void refresh()}>重新整理</button>
+          {selectedConfigId && <button className="ghost" onClick={onShowAll}>{t('history.viewAll')}</button>}
+          <button onClick={() => void refresh()}>{t('topbar.refresh')}</button>
         </div>
       </div>
       <HistoryTable history={mergedHistory} configs={configs} onInspect={inspect} onDownload={(id) => api.downloadHistory(id).catch((err) => setError(err.message))} />
       <div className="pagination">
-        <button className="ghost" disabled={page <= 1} onClick={() => void onPageChange(page - 1)}>上一頁</button>
-        <span>第 {page} 頁</span>
-        <button className="ghost" disabled={!hasNext} onClick={() => void onPageChange(page + 1)}>下一頁</button>
+        <button className="ghost" disabled={page <= 1} onClick={() => void onPageChange(page - 1)}>{t('history.pagination.prev')}</button>
+        <span>{t('history.pagination.page', { page })}</span>
+        <button className="ghost" disabled={!hasNext} onClick={() => void onPageChange(page + 1)}>{t('history.pagination.next')}</button>
       </div>
     </section>
   );
 }
 
 const HistoryTable = React.memo(function HistoryTable({ history, configs, compact = false, onDownload, onInspect }: { history: BackupHistory[]; configs: BackupConfig[]; compact?: boolean; onDownload?: (id: string) => void; onInspect?: (row: BackupHistory) => void }) {
+  const { t } = useLanguage();
   const names = useMemo(() => new Map(configs.map((config) => [config.id, config.name])), [configs]);
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>任務</th><th>狀態</th><th>觸發</th><th>大小</th><th>開始</th>{!compact && <th>操作</th>}</tr></thead>
+        <thead><tr><th>{t('history.columns.task')}</th><th>{t('history.columns.status')}</th><th>{t('history.columns.trigger')}</th><th>{t('history.columns.size')}</th><th>{t('history.columns.started')}</th>{!compact && <th>{t('history.columns.actions')}</th>}</tr></thead>
         <tbody>
           {history.map((row) => (
             <tr key={row.id}>
@@ -1058,17 +1076,18 @@ const HistoryTable = React.memo(function HistoryTable({ history, configs, compac
               <td>{row.triggered_by}</td>
               <td>{formatBytes(row.file_size)}</td>
               <td>{new Date(row.started_at).toLocaleString()}</td>
-              {!compact && <td><div className="history-actions"><button className="ghost" onClick={() => onInspect?.(row)}>查看流程</button>{row.status === 'success' && <button onClick={() => onDownload?.(row.id)}>下載</button>}</div></td>}
+              {!compact && <td><div className="history-actions"><button className="ghost" onClick={() => onInspect?.(row)}>{t('history.viewFlow')}</button>{row.status === 'success' && <button onClick={() => onDownload?.(row.id)}>{t('history.download')}</button>}</div></td>}
             </tr>
           ))}
         </tbody>
       </table>
-      {history.length === 0 && <p className="muted empty">尚無記錄</p>}
+      {history.length === 0 && <p className="muted empty">{t('history.empty')}</p>}
     </div>
   );
 });
 
 function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient; users: User[]; refresh: () => Promise<void>; setError: (error: string | null) => void; currentUser: User }) {
+  const { t } = useLanguage();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
 
@@ -1081,7 +1100,7 @@ function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient;
       setPassword('');
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '建立使用者失敗');
+      setError(err instanceof Error ? err.message : t('error.createUserFailed'));
     }
   }
 
@@ -1090,23 +1109,23 @@ function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient;
       await api.deleteUser(userId);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '刪除使用者失敗');
+      setError(err instanceof Error ? err.message : t('error.deleteUserFailed'));
     }
   }, [api, refresh, setError]);
 
   return (
     <section className="two-column narrow">
       <form className="panel form" onSubmit={submit}>
-        <h2>新增管理員</h2>
-        <label>帳號<input required value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-        <label>密碼<input required type="password" minLength={12} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
-        <button>建立使用者</button>
+        <h2>{t('users.createAdmin')}</h2>
+        <label>{t('users.username')}<input required value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+        <label>{t('users.password')}<input required type="password" minLength={12} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        <button>{t('users.create')}</button>
       </form>
       <div className="panel">
-        <h2>使用者</h2>
+        <h2>{t('users.title')}</h2>
         <table>
-          <thead><tr><th>帳號</th><th>角色</th><th>操作</th></tr></thead>
-          <tbody>{users.map((item) => <tr key={item.id}><td>{item.username}</td><td>{item.role}</td><td>{item.id !== currentUser.id && <button className="danger" onClick={() => void handleDeleteUser(item.id)}>刪除</button>}</td></tr>)}</tbody>
+          <thead><tr><th>{t('users.columns.username')}</th><th>{t('users.columns.role')}</th><th>{t('users.columns.actions')}</th></tr></thead>
+          <tbody>{users.map((item) => <tr key={item.id}><td>{item.username}</td><td>{item.role}</td><td>{item.id !== currentUser.id && <button className="danger" onClick={() => void handleDeleteUser(item.id)}>{t('users.delete')}</button>}</td></tr>)}</tbody>
         </table>
       </div>
     </section>
@@ -1117,6 +1136,6 @@ const StatusBadge = React.memo(function StatusBadge({ status }: { status: string
   return <span className={`badge ${status}`}>{status}</span>;
 });
 
-function tabTitle(tab: Tab) {
-  return ({ dashboard: 'Dashboard', configs: '備份設定', history: '歷史記錄', users: '使用者管理' } satisfies Record<Tab, string>)[tab];
+function tabTitle(tab: Tab, t: (key: string) => string) {
+  return ({ dashboard: t('nav.dashboard'), configs: t('nav.configs'), history: t('nav.history'), users: t('nav.users') } satisfies Record<Tab, string>)[tab];
 }

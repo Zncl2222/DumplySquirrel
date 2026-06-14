@@ -1,0 +1,228 @@
+{
+  "app": {
+    "name": "DumplySquirrel",
+    "subtitle": "備份管理系統"
+  },
+  "nav": {
+    "dashboard": "Dashboard",
+    "configs": "備份設定",
+    "history": "歷史記錄",
+    "users": "使用者",
+    "logout": "登出"
+  },
+  "topbar": {
+    "refresh": "重新整理",
+    "syncing": "同步資料中...",
+    "synced": "系統狀態已同步"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "totalTasks": "任務數",
+    "totalBackups": "備份次數",
+    "success": "成功",
+    "failed": "失敗",
+    "storage": "儲存用量",
+    "recentBackups": "最近備份"
+  },
+  "configs": {
+    "title": "備份設定",
+    "description": "管理你的資料庫備份任務。每個設定對應一個資料庫連線與排程。",
+    "searchPlaceholder": "搜尋名稱或連線位址...",
+    "filterAll": "全部",
+    "addDatabase": "新增資料庫",
+    "columns": {
+      "name": "名稱",
+      "type": "類型",
+      "version": "版本",
+      "schedule": "排程",
+      "retention": "保留",
+      "status": "狀態"
+    },
+    "actions": {
+      "history": "歷史",
+      "backup": "備份",
+      "backupRunning": "備份中",
+      "disable": "停用",
+      "enable": "啟用",
+      "edit": "編輯",
+      "delete": "刪除"
+    },
+    "empty": {
+      "title": "還沒有備份設定",
+      "description": "新增你的第一個資料庫備份任務，設定排程後系統會自動執行。"
+    },
+    "emptySearch": {
+      "title": "找不到符合的設定",
+      "description": "嘗試調整搜尋條件或篩選器。"
+    },
+    "form": {
+      "createTitle": "新增備份設定",
+      "editTitle": "編輯備份設定",
+      "name": "名稱",
+      "dbType": "資料庫類型",
+      "dbVersion": "Dump 版本",
+      "dbUrl": "DB URL",
+      "dbUrlPlaceholder": "postgres://user:pass@host:5432/db",
+      "schedule": "自動備份排程",
+      "scheduleDescription": "已設定週期性自動備份。",
+      "scheduleManual": "不會自動執行，只能手動點「立即備份」。",
+      "setSchedule": "設定排程",
+      "retentionDays": "保留天數",
+      "timeoutSeconds": "Timeout 秒",
+      "maxBackups": "最多保留份數",
+      "enableSchedule": "啟用排程",
+      "editNote": "更新設定需要重新輸入完整 DB URL，API 不會回傳完整連線字串。",
+      "cancel": "取消",
+      "create": "建立設定",
+      "update": "更新設定"
+    },
+    "schedule": {
+      "title": "設定自動備份排程",
+      "description": "選擇週期與時間，或切到自訂 cron。下方會即時顯示實際執行時間。",
+      "type": "排程類型",
+      "typeManual": "手動（不自動備份）",
+      "typeMinute": "每幾分鐘",
+      "typeHour": "每幾小時",
+      "typeDaily": "每天",
+      "typeWeekly": "每週",
+      "typeMonthly": "每月",
+      "typeYearly": "每年",
+      "typeCustom": "手動輸入 cron",
+      "everyMinutes": "每 {interval} 分鐘",
+      "everyHours": "每 {interval} 小時",
+      "startFromMinute": "從每小時幾分開始",
+      "startTime": "開始時間",
+      "weekdays": "星期幾執行",
+      "monthDay": "每月幾號執行",
+      "yearMonth": "每年幾月執行",
+      "yearDay": "幾號執行",
+      "customCron": "手動輸入 cron",
+      "preview": "排程預覽",
+      "previewStart": "開始",
+      "previewManual": "手動（不自動備份）",
+      "apply": "套用排程"
+    },
+    "delete": {
+      "title": "確定要刪除備份設定？",
+      "description": "這會刪除「{name}」的設定，之後不會再依照這個排程自動備份。",
+      "cancel": "取消",
+      "confirm": "確認刪除"
+    }
+  },
+  "history": {
+    "title": "歷史記錄",
+    "descriptionAll": "正在執行的備份會出現在同一張表；點「查看流程」開啟 Run Room 詳情。",
+    "descriptionFiltered": "目前只顯示「{name}」的每一次備份執行紀錄。",
+    "viewAll": "查看全部歷史",
+    "viewFlow": "查看流程",
+    "download": "下載",
+    "empty": "尚無記錄",
+    "columns": {
+      "task": "任務",
+      "status": "狀態",
+      "trigger": "觸發",
+      "size": "大小",
+      "started": "開始",
+      "actions": "操作"
+    },
+    "pagination": {
+      "prev": "上一頁",
+      "next": "下一頁",
+      "page": "第 {page} 頁"
+    },
+    "detail": {
+      "breadcrumb": "歷史記錄路徑",
+      "back": "← 返回歷史記錄",
+      "kicker": "備份執行詳情",
+      "runningDescription": "這筆備份正在執行，事件會每 2 秒更新。",
+      "completedDescription": "這是該筆備份留下的流程與事件紀錄。",
+      "status": "狀態",
+      "stage": "階段",
+      "duration": "已執行",
+      "completedDuration": "耗時",
+      "trigger": "觸發",
+      "eventsTitle": "事件紀錄",
+      "eventsLoading": "載入事件中",
+      "noEvents": "還沒有正在執行的備份。啟動任務後，事件會在這裡逐行出現。",
+      "waitingEvents": "備份已建立，正在等待第一筆事件。",
+      "polling": "polling 2s"
+    }
+  },
+  "users": {
+    "title": "使用者",
+    "createAdmin": "新增管理員",
+    "username": "帳號",
+    "password": "密碼",
+    "create": "建立使用者",
+    "columns": {
+      "username": "帳號",
+      "role": "角色",
+      "actions": "操作"
+    },
+    "delete": "刪除"
+  },
+  "login": {
+    "title": "登入備份管理台",
+    "username": "帳號",
+    "password": "密碼",
+    "submit": "登入",
+    "loading": "登入中...",
+    "error": "登入失敗"
+  },
+  "status": {
+    "enabled": "enabled",
+    "disabled": "disabled",
+    "running": "running",
+    "success": "success",
+    "failed": "failed",
+    "timeout": "timeout"
+  },
+  "dbType": {
+    "postgres": "PostgreSQL",
+    "mysql": "MySQL",
+    "pg": "PG",
+    "my": "MY"
+  },
+  "scheduleSummary": {
+    "manual": "手動（不自動備份）",
+    "start": "開始"
+  },
+  "cron": {
+    "everyMinutes": "每 {interval} 分鐘",
+    "everyHoursAtMinute": "每 {interval} 小時的 {minute} 分",
+    "hourlyAtMinute": "每小時 {minute} 分",
+    "dailyAt": "每天 {time}",
+    "weeklyAt": "每週{days} {time}",
+    "monthlyAt": "每月 {day} 日 {time}",
+    "yearlyAt": "每年 {month} 月 {day} 日 {time}",
+    "weekdaySeparator": "、"
+  },
+  "units": {
+    "days": "天",
+    "hours": "時",
+    "minutes": "分"
+  },
+  "weekdays": {
+    "sunday": "週日",
+    "monday": "週一",
+    "tuesday": "週二",
+    "wednesday": "週三",
+    "thursday": "週四",
+    "friday": "週五",
+    "saturday": "週六"
+  },
+  "mysql": {
+    "note": "MySQL 目前使用系統 mysqldump；版本選項只作為設定標示用途。"
+  },
+  "error": {
+    "loadFailed": "載入失敗",
+    "loadHistoryFailed": "載入歷史記錄失敗",
+    "createConfigFailed": "儲存設定失敗",
+    "deleteConfigFailed": "刪除設定失敗",
+    "toggleStatusFailed": "切換狀態失敗",
+    "triggerBackupFailed": "啟動備份失敗",
+    "createUserFailed": "建立使用者失敗",
+    "deleteUserFailed": "刪除使用者失敗",
+    "loadEventsFailed": "載入流程事件失敗"
+  }
+}
