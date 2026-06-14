@@ -63,6 +63,7 @@
       "dbVersion": "Dump Version",
       "dbUrl": "DB URL",
       "dbUrlPlaceholder": "postgres://user:pass@host:5432/db",
+      "dbUrlEditPlaceholder": "Leave blank to keep the current DB URL",
       "schedule": "Auto Backup Schedule",
       "scheduleDescription": "Periodic auto backup is configured.",
       "scheduleManual": "Will not auto-execute. You can only trigger manually.",
@@ -71,7 +72,7 @@
       "timeoutSeconds": "Timeout Seconds",
       "maxBackups": "Max Backups",
       "enableSchedule": "Enable Schedule",
-      "editNote": "Updating config requires re-entering the full DB URL. The API does not return the full connection string.",
+      "editNote": "Leave DB URL blank to keep the current connection string; enter a new value only when replacing it.",
       "cancel": "Cancel",
       "create": "Create Config",
       "update": "Update Config"
@@ -101,6 +102,21 @@
       "previewStart": "start",
       "previewManual": "Manual (no auto backup)",
       "apply": "Apply Schedule"
+    },
+    "notifications": {
+      "title": "Email Notifications",
+      "notifyOn": "Send email on",
+      "never": "Do not send",
+      "failure": "Failure or timeout only",
+      "always": "Success and failure",
+      "to": "Recipients To",
+      "cc": "Recipients CC",
+      "toPlaceholder": "ops@company.com, dba@company.com",
+      "ccPlaceholder": "manager@company.com",
+      "description": "Separate multiple emails with commas, semicolons, or new lines. SMTP sender settings are configured through environment variables.",
+      "summaryNever": "Notify: off",
+      "summaryFailure": "Notify: failures to {count}",
+      "summaryAlways": "Notify: all results to {count}"
     },
     "delete": {
       "title": "Delete backup config?",

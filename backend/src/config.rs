@@ -12,6 +12,23 @@ pub struct AppConfig {
     pub jwt_ttl_seconds: i64,
     pub max_concurrent_backups: usize,
     pub cors_allowed_origin: Option<String>,
+    pub smtp: Option<SmtpConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub from: String,
+    pub tls: SmtpTlsMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SmtpTlsMode {
+    StartTls,
+    None,
 }
 
 impl AppConfig {
@@ -35,6 +52,7 @@ impl AppConfig {
         let cors_allowed_origin = env::var("CORS_ALLOWED_ORIGIN")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        let smtp = smtp_config_from_env()?;
 
         if jwt_ttl_seconds < 60 {
             anyhow::bail!("JWT_TTL_SECONDS must be at least 60");
@@ -54,8 +72,47 @@ impl AppConfig {
             jwt_ttl_seconds,
             max_concurrent_backups,
             cors_allowed_origin,
+            smtp,
         })
     }
+}
+
+fn smtp_config_from_env() -> anyhow::Result<Option<SmtpConfig>> {
+    let host = optional_env("SMTP_HOST");
+    let from = optional_env("SMTP_FROM");
+    let (Some(host), Some(from)) = (host, from) else {
+        return Ok(None);
+    };
+
+    let port = env::var("SMTP_PORT")
+        .unwrap_or_else(|_| "587".into())
+        .parse()?;
+    let tls = match env::var("SMTP_TLS")
+        .unwrap_or_else(|_| "starttls".into())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "starttls" | "tls" => SmtpTlsMode::StartTls,
+        "none" | "plain" => SmtpTlsMode::None,
+        other => anyhow::bail!("SMTP_TLS must be starttls or none, got {other}"),
+    };
+
+    Ok(Some(SmtpConfig {
+        host,
+        port,
+        username: optional_env("SMTP_USERNAME"),
+        password: optional_env("SMTP_PASSWORD"),
+        from,
+        tls,
+    }))
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn required_env(name: &str) -> anyhow::Result<String> {

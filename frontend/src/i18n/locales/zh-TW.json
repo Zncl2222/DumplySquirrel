@@ -63,6 +63,7 @@
       "dbVersion": "Dump 版本",
       "dbUrl": "DB URL",
       "dbUrlPlaceholder": "postgres://user:pass@host:5432/db",
+      "dbUrlEditPlaceholder": "留空沿用目前的 DB URL",
       "schedule": "自動備份排程",
       "scheduleDescription": "已設定週期性自動備份。",
       "scheduleManual": "不會自動執行，只能手動點「立即備份」。",
@@ -71,7 +72,7 @@
       "timeoutSeconds": "Timeout 秒",
       "maxBackups": "最多保留份數",
       "enableSchedule": "啟用排程",
-      "editNote": "更新設定需要重新輸入完整 DB URL，API 不會回傳完整連線字串。",
+      "editNote": "DB URL 留空會沿用目前的連線字串；只有輸入新值時才會覆蓋。",
       "cancel": "取消",
       "create": "建立設定",
       "update": "更新設定"
@@ -101,6 +102,21 @@
       "previewStart": "開始",
       "previewManual": "手動（不自動備份）",
       "apply": "套用排程"
+    },
+    "notifications": {
+      "title": "Email 通知",
+      "notifyOn": "寄信時機",
+      "never": "不寄信",
+      "failure": "失敗或 timeout 才寄",
+      "always": "成功與失敗都寄",
+      "to": "收件人 To",
+      "cc": "副本 CC",
+      "toPlaceholder": "ops@company.com, dba@company.com",
+      "ccPlaceholder": "manager@company.com",
+      "description": "可用逗號、分號或換行分隔多個 email。SMTP 寄件帳號由系統環境變數設定。",
+      "summaryNever": "通知：不寄信",
+      "summaryFailure": "通知：失敗寄給 {count} 人",
+      "summaryAlways": "通知：成功/失敗寄給 {count} 人"
     },
     "delete": {
       "title": "確定要刪除備份設定？",

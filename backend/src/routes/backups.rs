@@ -31,12 +31,17 @@ pub(super) struct BackupConfigRequest {
     name: String,
     db_type: String,
     db_version: Option<String>,
-    db_url: String,
+    db_url: Option<String>,
     cron_schedule: Option<String>,
     retention_days: Option<i32>,
     timeout_seconds: Option<i32>,
     max_backups: Option<i32>,
     is_enabled: Option<bool>,
+    #[serde(default)]
+    email_to: Vec<String>,
+    #[serde(default)]
+    email_cc: Vec<String>,
+    email_notify_on: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +61,9 @@ struct BackupConfigResponse {
     retention_days: i32,
     timeout_seconds: i32,
     max_backups: Option<i32>,
+    email_to: Vec<String>,
+    email_cc: Vec<String>,
+    email_notify_on: String,
     created_by: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -70,6 +78,7 @@ pub(super) async fn list_configs(
         r#"
         SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                is_enabled, retention_days, timeout_seconds, max_backups,
+               email_to, email_cc, email_notify_on,
                created_by, created_at, updated_at
         FROM backup_configs
         ORDER BY created_at DESC
@@ -92,25 +101,33 @@ pub(super) async fn create_config(
 ) -> AppResult<Json<serde_json::Value>> {
     let auth = state.auth.authorize(&headers, &state.config)?;
     validate_payload(&payload)?;
+    let db_url = payload
+        .db_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Validation("db_url is required".into()))?;
+    backup_executor::validate_database_url(&payload.db_type, db_url)?;
 
     let mut db_version = normalize_db_version(payload.db_version);
     if db_version.is_none() {
-        let detected =
-            backup_executor::detect_db_version(&payload.db_type, &payload.db_url, 30).await?;
+        let detected = backup_executor::detect_db_version(&payload.db_type, db_url, 30).await?;
         db_version = Some(detected);
     }
 
     let (ciphertext, nonce) =
-        crypto::encrypt_string(&payload.db_url, &state.config.database_encryption_key)?;
+        crypto::encrypt_string(db_url, &state.config.database_encryption_key)?;
 
     let config = sqlx::query_as::<_, BackupConfig>(
         r#"
         INSERT INTO backup_configs
             (id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
-             is_enabled, retention_days, timeout_seconds, max_backups, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 30), COALESCE($10, 3600), $11, $12)
+             is_enabled, retention_days, timeout_seconds, max_backups, email_to, email_cc,
+             email_notify_on, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 30), COALESCE($10, 3600), $11, $12, $13, $14, $15)
         RETURNING id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                   is_enabled, retention_days, timeout_seconds, max_backups,
+                  email_to, email_cc, email_notify_on,
                   created_by, created_at, updated_at
         "#,
     )
@@ -125,6 +142,9 @@ pub(super) async fn create_config(
     .bind(payload.retention_days)
     .bind(payload.timeout_seconds)
     .bind(payload.max_backups)
+    .bind(normalize_email_list(&payload.email_to))
+    .bind(normalize_email_list(&payload.email_cc))
+    .bind(normalize_notify_on(payload.email_notify_on.as_deref()))
     .bind(auth.id)
     .fetch_one(&state.db)
     .await?;
@@ -145,15 +165,44 @@ async fn update_config(
     state.auth.authorize(&headers, &state.config)?;
     validate_payload(&payload)?;
 
-    let mut db_version = normalize_db_version(payload.db_version);
-    if db_version.is_none() {
-        let detected =
-            backup_executor::detect_db_version(&payload.db_type, &payload.db_url, 30).await?;
-        db_version = Some(detected);
-    }
+    let existing = sqlx::query_as::<_, BackupConfig>(
+        r#"
+        SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
+               is_enabled, retention_days, timeout_seconds, max_backups,
+               email_to, email_cc, email_notify_on,
+               created_by, created_at, updated_at
+        FROM backup_configs
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
 
-    let (ciphertext, nonce) =
-        crypto::encrypt_string(&payload.db_url, &state.config.database_encryption_key)?;
+    let db_url = payload
+        .db_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut db_version = normalize_db_version(payload.db_version.clone());
+    let (ciphertext, nonce) = if let Some(db_url) = db_url {
+        backup_executor::validate_database_url(&payload.db_type, db_url)?;
+        if db_version.is_none() {
+            let detected = backup_executor::detect_db_version(&payload.db_type, db_url, 30).await?;
+            db_version = Some(detected);
+        }
+        crypto::encrypt_string(db_url, &state.config.database_encryption_key)?
+    } else {
+        if payload.db_type != existing.db_type {
+            return Err(AppError::Validation(
+                "db_url is required when changing db_type".into(),
+            ));
+        }
+        (
+            existing.db_url_encrypted.clone(),
+            existing.db_url_nonce.clone(),
+        )
+    };
 
     let config = sqlx::query_as::<_, BackupConfig>(
         r#"
@@ -168,10 +217,14 @@ async fn update_config(
             retention_days = COALESCE($9, retention_days),
             timeout_seconds = COALESCE($10, timeout_seconds),
             max_backups = $11,
+            email_to = $12,
+            email_cc = $13,
+            email_notify_on = $14,
             updated_at = now()
         WHERE id = $1
         RETURNING id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                   is_enabled, retention_days, timeout_seconds, max_backups,
+                  email_to, email_cc, email_notify_on,
                   created_by, created_at, updated_at
         "#,
     )
@@ -186,6 +239,9 @@ async fn update_config(
     .bind(payload.retention_days)
     .bind(payload.timeout_seconds)
     .bind(payload.max_backups)
+    .bind(normalize_email_list(&payload.email_to))
+    .bind(normalize_email_list(&payload.email_cc))
+    .bind(normalize_notify_on(payload.email_notify_on.as_deref()))
     .fetch_one(&state.db)
     .await?;
 
@@ -246,6 +302,7 @@ async fn toggle_config(
         WHERE id = $1
         RETURNING id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                   is_enabled, retention_days, timeout_seconds, max_backups,
+                  email_to, email_cc, email_notify_on,
                   created_by, created_at, updated_at
         "#,
     )
@@ -291,7 +348,6 @@ fn validate_payload(payload: &BackupConfigRequest) -> AppResult<()> {
         ));
     }
     validate_db_version(&payload.db_type, payload.db_version.as_deref())?;
-    backup_executor::validate_database_url(&payload.db_type, &payload.db_url)?;
     if let Some(schedule) = &payload.cron_schedule {
         scheduler::validate_cron_expression(schedule)?;
     }
@@ -308,7 +364,62 @@ fn validate_payload(payload: &BackupConfigRequest) -> AppResult<()> {
     if payload.max_backups.is_some_and(|value| value < 1) {
         return Err(AppError::Validation("max_backups must be positive".into()));
     }
+    let notify_on = normalize_notify_on(payload.email_notify_on.as_deref());
+    if !matches!(notify_on.as_str(), "never" | "failure" | "always") {
+        return Err(AppError::Validation(
+            "email_notify_on must be never, failure, or always".into(),
+        ));
+    }
+    validate_email_list(&payload.email_to)?;
+    validate_email_list(&payload.email_cc)?;
+    if notify_on != "never" && normalize_email_list(&payload.email_to).is_empty() {
+        return Err(AppError::Validation(
+            "email_to is required when email notifications are enabled".into(),
+        ));
+    }
     Ok(())
+}
+
+fn normalize_notify_on(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("never")
+        .to_ascii_lowercase()
+}
+
+fn normalize_email_list(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .fold(Vec::new(), |mut acc, value| {
+            if !acc.contains(&value) {
+                acc.push(value);
+            }
+            acc
+        })
+}
+
+fn validate_email_list(values: &[String]) -> AppResult<()> {
+    for email in normalize_email_list(values) {
+        if !is_valid_email(&email) {
+            return Err(AppError::Validation(format!(
+                "invalid email address `{email}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_email(value: &str) -> bool {
+    if value.contains(char::is_whitespace) || value.contains(['\n', '\r']) {
+        return false;
+    }
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
 fn config_response(config: BackupConfig, encryption_key: &str) -> AppResult<BackupConfigResponse> {
@@ -328,6 +439,9 @@ fn config_response(config: BackupConfig, encryption_key: &str) -> AppResult<Back
         retention_days: config.retention_days,
         timeout_seconds: config.timeout_seconds,
         max_backups: config.max_backups,
+        email_to: config.email_to,
+        email_cc: config.email_cc,
+        email_notify_on: config.email_notify_on,
         created_by: config.created_by,
         created_at: config.created_at,
         updated_at: config.updated_at,

@@ -31,6 +31,9 @@ type ConfigFormState = {
   timeout_seconds: number;
   max_backups: string;
   is_enabled: boolean;
+  email_to: string;
+  email_cc: string;
+  email_notify_on: 'never' | 'failure' | 'always';
 };
 
 const emptyConfigForm: ConfigFormState = {
@@ -43,6 +46,9 @@ const emptyConfigForm: ConfigFormState = {
   timeout_seconds: 3600,
   max_backups: '',
   is_enabled: true,
+  email_to: '',
+  email_cc: '',
+  email_notify_on: 'never',
 };
 
 type ScheduleMode = 'manual' | 'minute' | 'hour' | 'daily' | 'weekly' | 'monthly' | 'yearly' | 'custom';
@@ -160,6 +166,26 @@ function cronFromScheduleDraft(draft: ScheduleDraft) {
 
 function scheduleSummary(schedule: string, t: (key: string) => string) {
   return schedule ? `${cronToHuman(schedule, t)} ${t('scheduleSummary.start')}` : t('scheduleSummary.manual');
+}
+
+function parseRecipients(value: string) {
+  return value
+    .split(/[\n,;]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item, index, items) => items.indexOf(item) === index);
+}
+
+function formatRecipients(values: string[]) {
+  return values.join(', ');
+}
+
+function notificationSummary(config: BackupConfig, t: (key: string, params?: Record<string, string | number>) => string) {
+  const notifyOn = config.email_notify_on ?? 'never';
+  if (notifyOn === 'never') return t('configs.notifications.summaryNever');
+  const count = (config.email_to ?? []).length + (config.email_cc ?? []).length;
+  if (notifyOn === 'failure') return t('configs.notifications.summaryFailure', { count });
+  return t('configs.notifications.summaryAlways', { count });
 }
 
 export function App() {
@@ -612,13 +638,19 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
       name: form.name,
       db_type: form.db_type,
       db_version: form.db_version || null,
-      db_url: form.db_url,
       cron_schedule: form.cron_schedule.trim() || null,
       retention_days: Number(form.retention_days),
       timeout_seconds: Number(form.timeout_seconds),
       max_backups: form.max_backups === '' ? null : Number(form.max_backups),
       is_enabled: form.is_enabled,
+      email_to: parseRecipients(form.email_to),
+      email_cc: parseRecipients(form.email_cc),
+      email_notify_on: form.email_notify_on,
     };
+    const dbUrl = form.db_url.trim();
+    if (!editingId || dbUrl) {
+      payload.db_url = dbUrl;
+    }
     try {
       if (editingId) {
         await api.updateConfig(editingId, payload);
@@ -652,6 +684,9 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
       timeout_seconds: config.timeout_seconds,
       max_backups: config.max_backups?.toString() ?? '',
       is_enabled: config.is_enabled,
+      email_to: formatRecipients(config.email_to ?? []),
+      email_cc: formatRecipients(config.email_cc ?? []),
+      email_notify_on: config.email_notify_on ?? 'never',
     });
     setShowPanel(true);
   }
@@ -744,6 +779,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
                     <td className="config-schedule">
                       {scheduleSummary(config.cron_schedule ?? '', t)}
                       {config.cron_schedule && <code title={config.cron_schedule}>{config.cron_schedule}</code>}
+                      <span className="notification-summary">{notificationSummary(config, t)}</span>
                     </td>
                     <td className="config-retention">{config.retention_days} {t('units.days')}</td>
                     <td><StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} /></td>
@@ -784,7 +820,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
               <label>{t('configs.form.dbType')}<select value={form.db_type} onChange={(e) => setForm((prev) => ({ ...prev, db_type: e.target.value as 'postgres' | 'mysql', db_version: '' }))}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
               <label>{t('configs.form.dbVersion')}<select value={form.db_version} onChange={(e) => setForm((prev) => ({ ...prev, db_version: e.target.value }))}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
               {form.db_type === 'mysql' && <p className="muted">{t('mysql.note')}</p>}
-              <label>{t('configs.form.dbUrl')}<input required placeholder={t('configs.form.dbUrlPlaceholder')} value={form.db_url} onChange={(e) => setForm((prev) => ({ ...prev, db_url: e.target.value }))} /></label>
+              <label>{t('configs.form.dbUrl')}<input required={!editingId} placeholder={editingId ? t('configs.form.dbUrlEditPlaceholder') : t('configs.form.dbUrlPlaceholder')} value={form.db_url} onChange={(e) => setForm((prev) => ({ ...prev, db_url: e.target.value }))} /></label>
               <div className="schedule-summary">
                 <span>{t('configs.form.schedule')}</span>
                 <strong>{scheduleSummary(form.cron_schedule, t)}</strong>
@@ -797,6 +833,13 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
               </div>
               <label>{t('configs.form.maxBackups')}<input type="number" min="1" value={form.max_backups} onChange={(e) => setForm((prev) => ({ ...prev, max_backups: e.target.value }))} /></label>
               <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(e) => setForm((prev) => ({ ...prev, is_enabled: e.target.checked }))} />{t('configs.form.enableSchedule')}</label>
+              <fieldset className="notification-fields">
+                <legend>{t('configs.notifications.title')}</legend>
+                <label>{t('configs.notifications.notifyOn')}<select value={form.email_notify_on} onChange={(e) => setForm((prev) => ({ ...prev, email_notify_on: e.target.value as ConfigFormState['email_notify_on'] }))}><option value="never">{t('configs.notifications.never')}</option><option value="failure">{t('configs.notifications.failure')}</option><option value="always">{t('configs.notifications.always')}</option></select></label>
+                <label>{t('configs.notifications.to')}<textarea rows={3} required={form.email_notify_on !== 'never'} placeholder={t('configs.notifications.toPlaceholder')} value={form.email_to} onChange={(e) => setForm((prev) => ({ ...prev, email_to: e.target.value }))} /></label>
+                <label>{t('configs.notifications.cc')}<textarea rows={2} placeholder={t('configs.notifications.ccPlaceholder')} value={form.email_cc} onChange={(e) => setForm((prev) => ({ ...prev, email_cc: e.target.value }))} /></label>
+                <p className="muted">{t('configs.notifications.description')}</p>
+              </fieldset>
             </form>
             <div className="config-panel-footer">
               <button className="ghost" onClick={closePanel}>{t('configs.form.cancel')}</button>

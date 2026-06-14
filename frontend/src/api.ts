@@ -18,6 +18,9 @@ export type BackupConfig = {
   retention_days: number;
   timeout_seconds: number;
   max_backups: number | null;
+  email_to: string[];
+  email_cc: string[];
+  email_notify_on: 'never' | 'failure' | 'always';
   created_at: string;
   updated_at: string;
 };
@@ -73,12 +76,15 @@ export type ConfigPayload = {
   name: string;
   db_type: 'postgres' | 'mysql';
   db_version?: string | null;
-  db_url: string;
+  db_url?: string;
   cron_schedule?: string | null;
   retention_days?: number;
   timeout_seconds?: number;
   max_backups?: number | null;
   is_enabled?: boolean;
+  email_to?: string[];
+  email_cc?: string[];
+  email_notify_on?: 'never' | 'failure' | 'always';
 };
 
 export type HistoryQuery = {

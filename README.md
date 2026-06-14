@@ -19,6 +19,12 @@ BACKUP_STORAGE_PATH=/mnt/storage/dumply/backups
 
 Relative paths such as `./backups` are resolved from the directory containing `docker-compose.yml`.
 
+Email notifications use the SMTP sender configured in `.env`. You can edit `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, and `SMTP_TLS` manually, or run:
+
+```bash
+sh scripts/configure-email.sh
+```
+
 For TLS, place `fullchain.pem` and `privkey.pem` under `./certs`, set `ENABLE_TLS=true`, then run `docker compose up --build`.
 
 ## Local Dev

@@ -11,8 +11,23 @@ use crate::{
     config::AppConfig,
     db::models::{BackupConfig, BackupHistory},
     error::{AppError, AppResult},
-    services::crypto,
+    services::{crypto, email_notifier},
 };
+
+#[derive(Debug, Clone, Copy)]
+enum BackupFinalStatus {
+    Success,
+    Timeout,
+}
+
+impl BackupFinalStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Timeout => "timeout",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct BackupRuntime {
@@ -59,6 +74,7 @@ async fn load_config(pool: &PgPool, config_id: Uuid) -> AppResult<BackupConfig> 
         r#"
         SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                is_enabled, retention_days, timeout_seconds, max_backups,
+               email_to, email_cc, email_notify_on,
                created_by, created_at, updated_at
         FROM backup_configs
         WHERE id = $1
@@ -122,12 +138,28 @@ async fn run_backup(
             let err = AppError::Internal(err.into());
             backup_event(&runtime.db, history_id, "queued", "error", &err.to_string()).await;
             mark_failed_if_running(&runtime.db, history_id, "failed", &err.to_string()).await?;
+            email_notifier::notify_backup_completed(
+                &runtime.db,
+                &runtime.config,
+                &config,
+                history_id,
+                "failed",
+            )
+            .await;
             return Err(err);
         }
         Err(_) => {
             let err = AppError::Conflict("backup queue is full; try again later".into());
             backup_event(&runtime.db, history_id, "queued", "error", &err.to_string()).await;
             mark_failed_if_running(&runtime.db, history_id, "failed", &err.to_string()).await?;
+            email_notifier::notify_backup_completed(
+                &runtime.db,
+                &runtime.config,
+                &config,
+                history_id,
+                "failed",
+            )
+            .await;
             return Err(err);
         }
     };
@@ -143,14 +175,34 @@ async fn run_backup(
     let result = execute_backup(&runtime, &config, history_id).await;
     drop(permit);
 
-    if let Err(err) = result {
-        let status = if matches!(err, AppError::BackupTimeout) {
-            "timeout"
-        } else {
-            "failed"
-        };
-        mark_failed_if_running(&runtime.db, history_id, status, &err.to_string()).await?;
-        return Err(err);
+    match result {
+        Ok(status) => {
+            email_notifier::notify_backup_completed(
+                &runtime.db,
+                &runtime.config,
+                &config,
+                history_id,
+                status.as_str(),
+            )
+            .await;
+        }
+        Err(err) => {
+            let status = if matches!(err, AppError::BackupTimeout) {
+                "timeout"
+            } else {
+                "failed"
+            };
+            mark_failed_if_running(&runtime.db, history_id, status, &err.to_string()).await?;
+            email_notifier::notify_backup_completed(
+                &runtime.db,
+                &runtime.config,
+                &config,
+                history_id,
+                status,
+            )
+            .await;
+            return Err(err);
+        }
     }
 
     Ok(())
@@ -160,7 +212,7 @@ async fn execute_backup(
     runtime: &BackupRuntime,
     config: &BackupConfig,
     history_id: Uuid,
-) -> AppResult<()> {
+) -> AppResult<BackupFinalStatus> {
     tokio::fs::create_dir_all(&runtime.config.backup_dir)
         .await
         .map_err(|err| AppError::Internal(err.into()))?;
@@ -260,7 +312,7 @@ async fn execute_backup(
                 "Backup completed successfully.",
             )
             .await;
-            Ok(())
+            Ok(BackupFinalStatus::Success)
         }
         Err(AppError::BackupTimeout) => {
             cleanup_partial_file(&output_path).await;
@@ -280,7 +332,7 @@ async fn execute_backup(
                 None,
             )
             .await?;
-            Ok(())
+            Ok(BackupFinalStatus::Timeout)
         }
         Err(err) => {
             cleanup_partial_file(&output_path).await;

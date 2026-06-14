@@ -47,6 +47,7 @@ impl BackupScheduler {
             r#"
             SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                    is_enabled, retention_days, timeout_seconds, max_backups,
+                   email_to, email_cc, email_notify_on,
                    created_by, created_at, updated_at
             FROM backup_configs
             WHERE is_enabled = true AND cron_schedule IS NOT NULL
@@ -68,6 +69,7 @@ impl BackupScheduler {
             r#"
             SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                    is_enabled, retention_days, timeout_seconds, max_backups,
+                   email_to, email_cc, email_notify_on,
                    created_by, created_at, updated_at
             FROM backup_configs
             WHERE id = $1
