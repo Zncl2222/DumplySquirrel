@@ -42,7 +42,7 @@ services:
       - "${DEV_BACKEND_PORT:-8000}:${DEV_BACKEND_PORT:-8000}"
     volumes:
       - ./backend:/app
-      - backup_data:/backups
+      - ${DEV_BACKUP_STORAGE_PATH:-./backups-dev}:/backups
       - cargo_target:/app/target
       - cargo_registry:/usr/local/cargo/registry
 
@@ -68,7 +68,6 @@ services:
 volumes:
   pgdata_dev:
     name: dumplysquirrel_pgdata_dev
-  backup_data:
   cargo_target:
   cargo_registry:
   frontend_node_modules:

@@ -11,6 +11,14 @@ docker compose up --build
 
 The dashboard is served by Nginx on `http://localhost` by default. The backend is available inside Docker Compose as `backend:3000` and is exposed through `/api`.
 
+Completed backup files are written inside the backend container at `/backups`. Set `BACKUP_STORAGE_PATH` in `.env` to choose where that directory is mounted on the host:
+
+```bash
+BACKUP_STORAGE_PATH=/mnt/storage/dumply/backups
+```
+
+Relative paths such as `./backups` are resolved from the directory containing `docker-compose.yml`.
+
 For TLS, place `fullchain.pem` and `privkey.pem` under `./certs`, set `ENABLE_TLS=true`, then run `docker compose up --build`.
 
 ## Local Dev
@@ -59,6 +67,7 @@ Reset the dev database volume completely:
 ```
 
 Dev-specific ports and origins live in `.env` / `.env.example` under the `Local dev stack` section.
+Docker dev backup files are stored under `DEV_BACKUP_STORAGE_PATH` on the host and mounted to `/backups` in the backend container.
 The dev stack is separate from production `docker-compose.yml`, so it will not bind the Nginx `80/443` ports unless you start the production stack explicitly.
 The frontend container will auto-run `npm ci` only when `node_modules` is missing.
 In dev, the browser talks to Vite on `:5173`, and Vite proxies `/api` to the backend container internally.

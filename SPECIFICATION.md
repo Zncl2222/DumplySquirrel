@@ -338,7 +338,7 @@ services:
       BACKUP_DIR: /backups
       RUST_LOG: info
     volumes:
-      - backup_data:/backups
+      - ${BACKUP_STORAGE_PATH:-./backups}:/backups
 
   frontend:
     build:
@@ -361,7 +361,6 @@ services:
 
 volumes:
   pgdata:
-  backup_data:
 ```
 
 ### 8.2 Backend Dockerfile（multi-stage）
@@ -410,6 +409,7 @@ ADMIN_PASSWORD=change_me_in_production
 SERVER_NAME=backup.example.com
 HTTP_PORT=80
 HTTPS_PORT=443
+BACKUP_STORAGE_PATH=./backups
 
 # TLS (optional)
 ENABLE_TLS=false

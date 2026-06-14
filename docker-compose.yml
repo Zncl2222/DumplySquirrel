@@ -37,7 +37,7 @@ services:
     expose:
       - "3000"
     volumes:
-      - backup_data:/backups
+      - ${BACKUP_STORAGE_PATH:-./backups}:/backups
 
   frontend:
     build:
@@ -61,4 +61,3 @@ services:
 
 volumes:
   pgdata:
-  backup_data:
