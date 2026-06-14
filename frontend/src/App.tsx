@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState, useDeferredValue } from 'react';
 import {
   ApiClient,
   BackupConfig,
@@ -171,9 +171,19 @@ export function App() {
   const [historyConfigId, setHistoryConfigId] = useState<string | null>(null);
   const [historyPage, setHistoryPage] = useState(1);
   const [historyHasNext, setHistoryHasNext] = useState(false);
+  const historyConfigIdRef = useRef(historyConfigId);
+  const historyPageRef = useRef(historyPage);
   const [users, setUsers] = useState<User[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    historyConfigIdRef.current = historyConfigId;
+  }, [historyConfigId]);
+
+  useEffect(() => {
+    historyPageRef.current = historyPage;
+  }, [historyPage]);
 
   useEffect(() => {
     api.setToken(token);
@@ -205,9 +215,9 @@ export function App() {
     };
   }, [api, token, user]);
 
-  async function refreshAll(options: RefreshOptions = {}) {
-    const requestedHistoryConfigId = 'historyConfigId' in options ? options.historyConfigId : historyConfigId;
-    const requestedHistoryPage = options.historyPage ?? historyPage;
+  const refreshAll = useCallback(async (options: RefreshOptions = {}) => {
+    const requestedHistoryConfigId = 'historyConfigId' in options ? options.historyConfigId : historyConfigIdRef.current;
+    const requestedHistoryPage = options.historyPage ?? historyPageRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -236,9 +246,9 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [api]);
 
-  async function logout() {
+  const logout = useCallback(async () => {
     setLoading(true);
     try {
       await api.logout();
@@ -253,9 +263,9 @@ export function App() {
       setUsers([]);
       setLoading(false);
     }
-  }
+  }, [api]);
 
-  async function loadHistoryPage(page: number, configId = historyConfigId) {
+  const loadHistoryPage = useCallback(async (page: number, configId: string | null = historyConfigIdRef.current) => {
     setLoading(true);
     setError(null);
     try {
@@ -268,7 +278,7 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [api]);
 
   function openDashboard() {
     setHistoryConfigId(null);
@@ -395,9 +405,9 @@ function Dashboard({ stats, configs, history }: { stats: DashboardStats | null; 
   );
 }
 
-function Metric({ title, value }: { title: string; value: string | number }) {
+const Metric = React.memo(function Metric({ title, value }: { title: string; value: string | number }) {
   return <div className="metric"><span>{title}</span><strong>{value}</strong></div>;
-}
+});
 
 const runStages = [
   { key: 'queued', label: 'queue' },
@@ -535,6 +545,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
   const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
   const [showPanel, setShowPanel] = useState(false);
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [typeFilter, setTypeFilter] = useState<'all' | 'postgres' | 'mysql'>('all');
   const panelFormRef = useRef<HTMLFormElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -542,15 +553,15 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
 
   const filtered = useMemo(() => configs.filter((config) => {
     if (typeFilter !== 'all' && config.db_type !== typeFilter) return false;
-    if (search) {
-      const q = search.toLowerCase();
+    if (deferredSearch) {
+      const q = deferredSearch.toLowerCase();
       return (
         config.name.toLowerCase().includes(q) ||
         config.db_url_masked.toLowerCase().includes(q)
       );
     }
     return true;
-  }), [configs, search, typeFilter]);
+  }), [configs, deferredSearch, typeFilter]);
 
   useEffect(() => {
     if (!showPanel) return;
@@ -660,6 +671,15 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
     }
   }
 
+  const handleToggleConfig = useCallback(async (config: BackupConfig) => {
+    try {
+      await api.toggleConfig(config.id, !config.is_enabled);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '切換狀態失敗');
+    }
+  }, [api, refresh, setError]);
+
   return (
     <section className="configs-page">
       <div className="config-header">
@@ -718,7 +738,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
                       <div className="config-actions">
                         <button className="ghost" onClick={() => onViewHistory(config)}>歷史</button>
                         <button className={`ghost backup-trigger ${runningConfigIds.has(config.id) ? 'running' : ''}`} disabled={runningConfigIds.has(config.id)} onClick={() => void triggerBackup(config)}>{runningConfigIds.has(config.id) ? '備份中' : '備份'}</button>
-                        <button className="ghost" onClick={() => api.toggleConfig(config.id, !config.is_enabled).then(() => refresh()).catch((err) => setError(err.message))}>{config.is_enabled ? '停用' : '啟用'}</button>
+                        <button className="ghost" onClick={() => void handleToggleConfig(config)}>{config.is_enabled ? '停用' : '啟用'}</button>
                         <button className="ghost" onClick={() => openEdit(config)}>編輯</button>
                         <button className="danger" onClick={() => setDeleteTarget(config)}>刪除</button>
                       </div>
@@ -747,11 +767,11 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
             </div>
             <form ref={panelFormRef} className="config-panel-body form" onSubmit={submit}>
               {editingId && <p className="panel-note">更新設定需要重新輸入完整 DB URL，API 不會回傳完整連線字串。</p>}
-              <label>名稱<input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
-              <label>資料庫類型<select value={form.db_type} onChange={(e) => setForm({ ...form, db_type: e.target.value as 'postgres' | 'mysql', db_version: '' })}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
-              <label>Dump 版本<select value={form.db_version} onChange={(e) => setForm({ ...form, db_version: e.target.value })}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+              <label>名稱<input required value={form.name} onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))} /></label>
+              <label>資料庫類型<select value={form.db_type} onChange={(e) => setForm((prev) => ({ ...prev, db_type: e.target.value as 'postgres' | 'mysql', db_version: '' }))}><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option></select></label>
+              <label>Dump 版本<select value={form.db_version} onChange={(e) => setForm((prev) => ({ ...prev, db_version: e.target.value }))}>{dbVersionOptions(form.db_type).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
               {form.db_type === 'mysql' && <p className="muted">MySQL 目前使用系統 mysqldump；版本選項只作為設定標示用途。</p>}
-              <label>DB URL<input required placeholder="postgres://user:pass@host:5432/db" value={form.db_url} onChange={(e) => setForm({ ...form, db_url: e.target.value })} /></label>
+              <label>DB URL<input required placeholder="postgres://user:pass@host:5432/db" value={form.db_url} onChange={(e) => setForm((prev) => ({ ...prev, db_url: e.target.value }))} /></label>
               <div className="schedule-summary">
                 <span>自動備份排程</span>
                 <strong>{scheduleSummary(form.cron_schedule)}</strong>
@@ -759,11 +779,11 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
                 <button type="button" onClick={() => setScheduleDialogOpen(true)}>設定排程</button>
               </div>
               <div className="form-row">
-                <label>保留天數<input type="number" min="1" value={form.retention_days} onChange={(e) => setForm({ ...form, retention_days: Number(e.target.value) })} /></label>
-                <label>Timeout 秒<input type="number" min="1" value={form.timeout_seconds} onChange={(e) => setForm({ ...form, timeout_seconds: Number(e.target.value) })} /></label>
+                <label>保留天數<input type="number" min="1" value={form.retention_days} onChange={(e) => setForm((prev) => ({ ...prev, retention_days: Number(e.target.value) }))} /></label>
+                <label>Timeout 秒<input type="number" min="1" value={form.timeout_seconds} onChange={(e) => setForm((prev) => ({ ...prev, timeout_seconds: Number(e.target.value) }))} /></label>
               </div>
-              <label>最多保留份數<input type="number" min="1" value={form.max_backups} onChange={(e) => setForm({ ...form, max_backups: e.target.value })} /></label>
-              <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(e) => setForm({ ...form, is_enabled: e.target.checked })} />啟用排程</label>
+              <label>最多保留份數<input type="number" min="1" value={form.max_backups} onChange={(e) => setForm((prev) => ({ ...prev, max_backups: e.target.value }))} /></label>
+              <label className="check"><input type="checkbox" checked={form.is_enabled} onChange={(e) => setForm((prev) => ({ ...prev, is_enabled: e.target.checked }))} />啟用排程</label>
             </form>
             <div className="config-panel-footer">
               <button className="ghost" onClick={closePanel}>取消</button>
@@ -777,7 +797,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
         open={scheduleDialogOpen}
         value={form.cron_schedule}
         onApply={(schedule) => {
-          setForm({ ...form, cron_schedule: schedule });
+          setForm((prev) => ({ ...prev, cron_schedule: schedule }));
           setScheduleDialogOpen(false);
         }}
         onClose={() => setScheduleDialogOpen(false)}
@@ -1024,8 +1044,8 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
   );
 }
 
-function HistoryTable({ history, configs, compact = false, onDownload, onInspect }: { history: BackupHistory[]; configs: BackupConfig[]; compact?: boolean; onDownload?: (id: string) => void; onInspect?: (row: BackupHistory) => void }) {
-  const names = new Map(configs.map((config) => [config.id, config.name]));
+const HistoryTable = React.memo(function HistoryTable({ history, configs, compact = false, onDownload, onInspect }: { history: BackupHistory[]; configs: BackupConfig[]; compact?: boolean; onDownload?: (id: string) => void; onInspect?: (row: BackupHistory) => void }) {
+  const names = useMemo(() => new Map(configs.map((config) => [config.id, config.name])), [configs]);
   return (
     <div className="table-wrap">
       <table>
@@ -1046,7 +1066,7 @@ function HistoryTable({ history, configs, compact = false, onDownload, onInspect
       {history.length === 0 && <p className="muted empty">尚無記錄</p>}
     </div>
   );
-}
+});
 
 function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient; users: User[]; refresh: () => Promise<void>; setError: (error: string | null) => void; currentUser: User }) {
   const [username, setUsername] = useState('');
@@ -1065,6 +1085,15 @@ function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient;
     }
   }
 
+  const handleDeleteUser = useCallback(async (userId: string) => {
+    try {
+      await api.deleteUser(userId);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '刪除使用者失敗');
+    }
+  }, [api, refresh, setError]);
+
   return (
     <section className="two-column narrow">
       <form className="panel form" onSubmit={submit}>
@@ -1077,16 +1106,16 @@ function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient;
         <h2>使用者</h2>
         <table>
           <thead><tr><th>帳號</th><th>角色</th><th>操作</th></tr></thead>
-          <tbody>{users.map((item) => <tr key={item.id}><td>{item.username}</td><td>{item.role}</td><td>{item.id !== currentUser.id && <button className="danger" onClick={() => api.deleteUser(item.id).then(() => refresh()).catch((err) => setError(err.message))}>刪除</button>}</td></tr>)}</tbody>
+          <tbody>{users.map((item) => <tr key={item.id}><td>{item.username}</td><td>{item.role}</td><td>{item.id !== currentUser.id && <button className="danger" onClick={() => void handleDeleteUser(item.id)}>刪除</button>}</td></tr>)}</tbody>
         </table>
       </div>
     </section>
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
+const StatusBadge = React.memo(function StatusBadge({ status }: { status: string }) {
   return <span className={`badge ${status}`}>{status}</span>;
-}
+});
 
 function tabTitle(tab: Tab) {
   return ({ dashboard: 'Dashboard', configs: '備份設定', history: '歷史記錄', users: '使用者管理' } satisfies Record<Tab, string>)[tab];
