@@ -118,6 +118,7 @@ Dockerized 備份管理系統，提供 Web Dashboard 讓管理者設定、排程
 | `username` | VARCHAR(100) | UNIQUE, NOT NULL | 登入帳號 |
 | `password_hash` | VARCHAR(255) | NOT NULL | bcrypt 雜湊 |
 | `role` | VARCHAR(20) | NOT NULL, DEFAULT 'admin' | 角色 |
+| `token_version` | BIGINT | NOT NULL, DEFAULT 0 | 登出或密碼重設時遞增，使舊 JWT 失效 |
 | `created_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
 | `updated_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
 
@@ -174,7 +175,6 @@ Dockerized 備份管理系統，提供 Web Dashboard 讓管理者設定、排程
 |--------|------|------|------|
 | `GET` | `/api/users` | — | 使用者列表 |
 | `POST` | `/api/users` | `{ username, password, role? }` | 新增使用者 |
-| `PUT` | `/api/users/:id` | `{ username?, password?, role? }` | 編輯使用者 |
 | `DELETE` | `/api/users/:id` | — | 刪除使用者 |
 
 ### 5.3 Backup Configs（需 JWT）
@@ -250,7 +250,7 @@ backend/src/
 
 ```rust
 pub async fn execute_backup(config: BackupConfig, backup_dir: &Path) -> Result<BackupRecord> {
-    let file_name = format!("{}_{}.sql", config.id, chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+    let file_name = format!("{}_{}_{}.sql", config.id, chrono::Utc::now().format("%Y%m%d_%H%M%S"), history.id);
     let output_path = backup_dir.join(&file_name);
 
     let status = match config.db_type.as_str() {
@@ -260,7 +260,7 @@ pub async fn execute_backup(config: BackupConfig, backup_dir: &Path) -> Result<B
     };
 
     // 寫入 backup_history
-    // 清除超過 retention_days 的舊備份
+    // 以目前最新 retention policy 將過期檔案原子寫入 durable deletion outbox
 }
 ```
 
@@ -268,7 +268,8 @@ pub async fn execute_backup(config: BackupConfig, backup_dir: &Path) -> Result<B
 - 串流 stdout 直接寫入檔案，避免記憶體爆量
 - PostgreSQL 使用 `PGPASSWORD` 環境變數傳遞密碼（pg_dump），不可將密碼寫入命令列參數
 - MySQL 使用暫存 option file 或安全 stdin/config file 傳遞密碼，不可使用 `-p'password'` 命令列參數
-- 檔名使用 `config.id + timestamp` 產生，任務名稱僅作顯示用途，避免 path traversal 與非法檔名
+- 檔名使用 `config.id + timestamp + history.id` 產生，任務名稱僅作顯示用途，避免 path traversal、同秒碰撞與非法檔名
+- dump 先寫入權限 `0600` 的唯一 partial file，完成後需 fsync 檔案、原子 rename 並 fsync 父目錄；持久化未確認前不可標記 success
 - 每個 config 同時間只允許一個備份執行；全域備份 worker 需限制最大併發數
 - 單次備份需套用 `timeout_seconds`，逾時後終止子行程並標記為 `timeout`
 - 下載備份檔時必須確認 canonical path 位於 `BACKUP_DIR` 內，不可直接信任資料庫中的 `file_path`
@@ -330,7 +331,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://dumply:${DB_PASSWORD:?required}@postgres:5432/dumply_squirrel
+      DATABASE_URL: postgres://dumply:${DB_PASSWORD_URL_ENCODED:-${DB_PASSWORD:?required}}@postgres:5432/dumply_squirrel
       JWT_SECRET: ${JWT_SECRET:?required}
       DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:?required}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
@@ -346,8 +347,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "${HTTP_PORT:-80}:80"
-      - "${HTTPS_PORT:-443}:443"
+      - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
     depends_on: [backend]
     environment:
       NGINX_PORT: ${HTTP_PORT:-80}
@@ -391,19 +391,22 @@ CMD ["dumply-backend"]
 ### 8.3 環境變數 `.env.example`
 
 ```bash
-# Database
-DB_PASSWORD=change_me_in_production
+# Use scripts/init-env.sh to generate unique values; public placeholders are rejected.
+DB_PASSWORD=<generated-random-value>
+DB_PASSWORD_URL_ENCODED=
 
 # JWT
-JWT_SECRET=change_me_in_production
+JWT_SECRET=<generated-random-value>
 
 # Field encryption for target database URLs
-# Use a 32-byte base64 key in production.
-DATABASE_ENCRYPTION_KEY=change_me_32_bytes_minimum_secret
+# The initializer generates 32 random bytes encoded as hexadecimal.
+DATABASE_ENCRYPTION_KEY=<generated-random-value>
+DATABASE_ENCRYPTION_KEY_PREVIOUS=
 
 # Bootstrap admin
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD=change_me_in_production
+ADMIN_PASSWORD=<generated-random-value>
+RESET_ADMIN_PASSWORD_ON_START=false
 
 # Server
 SERVER_NAME=backup.example.com
@@ -476,7 +479,7 @@ ssl_protocols       TLSv1.2 TLSv1.3;
 ssl_ciphers         HIGH:!aNULL:!MD5;
 
 # 將 HTTP 導向 HTTPS（可選）
-# return 301 https://$host$request_uri;
+# return 308 https://$host:${NGINX_HTTPS_PORT}$request_uri;
 ```
 
 > 實現方式：使用 nginx:alpine 內建的 `/docker-entrypoint.d/` 機制，或撰寫自訂 entrypoint script 根據 `$ENABLE_TLS` 動態產生完整配置。
@@ -485,7 +488,7 @@ ssl_ciphers         HIGH:!aNULL:!MD5;
 
 ```dockerfile
 # Stage 1: Build React
-FROM node:20-alpine AS builder
+FROM node:24-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
@@ -494,10 +497,12 @@ ARG VITE_API_BASE_URL=/api
 RUN npm run build
 
 # Stage 2: Serve with nginx
-FROM nginx:1.27-alpine
+FROM nginx:1.30.4-alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx/templates /etc/nginx/templates
-# nginx:alpine entrypoint 會自動以 envsubst 處理 template
+COPY nginx/templates /etc/nginx/custom-templates
+COPY nginx/docker-entrypoint.d /docker-entrypoint.d
+RUN chmod +x /docker-entrypoint.d/99-dumply-render-config.sh
+# 自訂 entrypoint hook 只渲染 ENABLE_TLS 對應的單一 template。
 ```
 
 ### 9.5 TLS 使用方式
@@ -514,7 +519,7 @@ docker compose up
 # │   ├── fullchain.pem
 # │   └── privkey.pem
 
-ENABLE_TLS=true docker compose up
+ENABLE_TLS=true docker compose -f docker-compose.yml -f docker-compose.tls.yml up
 ```
 
 | 環境變數 | 預設值 | 說明 |
@@ -611,7 +616,8 @@ DumplySquirrel/
 
 - `db_url` 不得以明文存入資料庫；後端以 `DATABASE_ENCRYPTION_KEY` 加密後存成 `db_url_encrypted` 與 `db_url_nonce`。
 - API 回傳 backup config 時，一律回傳遮蔽後的 `db_url_masked`，例如 `postgres://user:****@host/db`。
-- JWT 必須設定短期效期，建議 1-8 小時；`logout` 若不導入 token denylist，需明確視為 client-side logout。
+- JWT 必須設定短期效期，建議 1-8 小時；受保護 API 必須比對使用者的 `token_version`。
+  `logout` 與管理員密碼重設會遞增版本，使該使用者先前簽發的 JWT 持久失效。
 - 密碼使用 bcrypt；新增/修改使用者時需做最小長度驗證。
 - 首次部署透過 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 建立 bootstrap admin，若已存在任何 user 則不重複建立。
 
@@ -621,7 +627,8 @@ DumplySquirrel/
 - 備份檔名由 `config_id + UTC timestamp` 組成，不使用使用者輸入的任務名稱。
 - 同一個 config 同時間只允許一個 running backup；全域需限制最大併發數，避免壓垮目標資料庫。
 - 每次備份有 timeout；逾時需 kill child process、標記 `timeout`，並清理不完整檔案。
-- retention 清理同時依 `retention_days` 與 `max_backups` 執行；刪除檔案失敗需保留錯誤日誌。
+- retention 清理同時依 `retention_days` 與 `max_backups` 執行；啟動時及每小時重跑。
+  清理必須鎖定並重讀最新設定，再把檔案原子寫入 durable deletion outbox；刪除失敗需保留重試狀態與錯誤日誌。
 
 ### 11.3 排程器規則
 
@@ -633,6 +640,7 @@ DumplySquirrel/
 ### 11.4 下載與檔案系統防護
 
 - 下載 API 只能使用 history id 查詢系統產生的檔案，不接受任意檔案路徑參數。
+- 前端以帶 Authorization 的 HEAD 先確認 session 與檔案可用，再用 native POST 讓瀏覽器直接串流，JWT 不得放入 URL。
 - 讀檔前需 canonicalize 並確認實際路徑仍位於 `BACKUP_DIR` 下。
 - 若 history 存在但檔案已被 retention 或人工刪除，應回傳 `404 FILE_MISSING`。
 

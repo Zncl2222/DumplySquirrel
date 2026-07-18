@@ -14,7 +14,7 @@ services:
       timeout: 5s
       retries: 5
     ports:
-      - "${DEV_POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${DEV_POSTGRES_PORT:-5432}:5432"
 
   backend:
     build:
@@ -26,13 +26,16 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://dumply:${DB_PASSWORD:?required}@postgres:5432/${DEV_DB_NAME:-dumply_squirrel_dev}
+      DATABASE_URL: postgres://dumply:${DB_PASSWORD_URL_ENCODED:-${DB_PASSWORD:?required}}@postgres:5432/${DEV_DB_NAME:-dumply_squirrel_dev}
       JWT_SECRET: ${JWT_SECRET:?required}
       DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:?required}
+      DATABASE_ENCRYPTION_KEY_PREVIOUS: ${DATABASE_ENCRYPTION_KEY_PREVIOUS:-}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?required}
+      RESET_ADMIN_PASSWORD_ON_START: ${RESET_ADMIN_PASSWORD_ON_START:-false}
       JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:-28800}
       MAX_CONCURRENT_BACKUPS: ${MAX_CONCURRENT_BACKUPS:-2}
+      ALLOW_INSECURE_DEV_SECRETS: ${DEV_ALLOW_INSECURE_SECRETS:-false}
       CORS_ALLOWED_ORIGIN: ${DEV_CORS_ALLOWED_ORIGIN:-http://localhost:5173}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
@@ -41,11 +44,11 @@ services:
       SMTP_FROM: ${SMTP_FROM:-}
       SMTP_TLS: ${SMTP_TLS:-starttls}
       BACKUP_DIR: /backups
-      BIND_ADDR: 0.0.0.0:${DEV_BACKEND_PORT:-8000}
+      BIND_ADDR: 0.0.0.0:8000
       RUST_LOG: ${DEV_RUST_LOG:-debug}
       CARGO_TERM_COLOR: always
     ports:
-      - "${DEV_BACKEND_PORT:-8000}:${DEV_BACKEND_PORT:-8000}"
+      - "127.0.0.1:${DEV_BACKEND_PORT:-8000}:8000"
     volumes:
       - ./backend:/app
       - ${DEV_BACKUP_STORAGE_PATH:-./backups-dev}:/backups
@@ -66,7 +69,7 @@ services:
       CHOKIDAR_USEPOLLING: ${DEV_CHOKIDAR_USEPOLLING:-true}
       DEV_FRONTEND_PORT: ${DEV_FRONTEND_PORT:-5173}
     ports:
-      - "${DEV_FRONTEND_PORT:-5173}:${DEV_FRONTEND_PORT:-5173}"
+      - "127.0.0.1:${DEV_FRONTEND_PORT:-5173}:${DEV_FRONTEND_PORT:-5173}"
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules

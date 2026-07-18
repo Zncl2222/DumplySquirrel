@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 target/
 backend/target/
 node_modules/
@@ -6,7 +8,7 @@ dist/
 frontend/.vite/
 *.tsbuildinfo
 .DS_Store
-backups/
-backups-dev/
+/backups/
+/backups-dev/
 certs/
 .superpowers/

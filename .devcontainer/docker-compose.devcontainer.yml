@@ -1,0 +1,52 @@
+# Dev container override layered on top of docker-compose.dev.yml.
+#
+# It adds a single `workspace` service that carries both the Rust and Node
+# toolchains. VS Code attaches to this container; the existing `postgres`
+# service from docker-compose.dev.yml runs alongside it on the same network
+# (reachable at host `postgres:5432`). The `backend` and `frontend` services
+# from the dev compose are intentionally left out of `runServices` in
+# devcontainer.json so you can run them yourself inside the workspace shell
+# without port conflicts.
+services:
+  workspace:
+    # Paths in this file resolve against the Compose project directory (the
+    # repo root), so the build context points at .devcontainer explicitly.
+    build:
+      context: .devcontainer
+      dockerfile: Dockerfile
+    # Mirrors the backend service env in docker-compose.dev.yml, plus the
+    # frontend dev vars. Values are interpolated from the repo-root .env.
+    environment:
+      DATABASE_URL: postgres://dumply:${DB_PASSWORD:?required}@postgres:5432/${DEV_DB_NAME:-dumply_squirrel_dev}
+      JWT_SECRET: ${JWT_SECRET:?required}
+      DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:?required}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?required}
+      JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:-28800}
+      MAX_CONCURRENT_BACKUPS: ${MAX_CONCURRENT_BACKUPS:-2}
+      CORS_ALLOWED_ORIGIN: ${DEV_CORS_ALLOWED_ORIGIN:-http://localhost:5173}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TLS: ${SMTP_TLS:-starttls}
+      BACKUP_DIR: /workspace/backups-dev
+      BIND_ADDR: 0.0.0.0:${DEV_BACKEND_PORT:-8000}
+      RUST_LOG: ${DEV_RUST_LOG:-debug}
+      CARGO_TERM_COLOR: always
+      # Frontend dev server: proxy to the backend running in this same
+      # container, and poll for file changes (reliable under WSL2/bind mounts).
+      VITE_API_BASE_URL: ${DEV_FRONTEND_API_BASE_URL:-/api}
+      VITE_DEV_PROXY_TARGET: ${DEV_LOCAL_FRONTEND_PROXY_TARGET:-http://127.0.0.1:8000}
+      CHOKIDAR_USEPOLLING: ${DEV_CHOKIDAR_USEPOLLING:-true}
+      DEV_FRONTEND_PORT: ${DEV_FRONTEND_PORT:-5173}
+    volumes:
+      # Bind-mount the whole repo (fast on the WSL2 Linux filesystem).
+      # "." is the Compose project directory == the repo root.
+      - .:/workspace:cached
+    # Keep the container alive; VS Code drives commands via the terminal.
+    command: sleep infinity
+    depends_on:
+      postgres:
+        condition: service_healthy

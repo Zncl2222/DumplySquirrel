@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::get,
@@ -21,7 +21,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_history))
         .route("/:id", get(get_history))
-        .route("/:id/download", get(download_history))
+        .route(
+            "/:id/download",
+            get(download_history).post(download_history_form),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,12 +35,20 @@ pub(super) struct HistoryQuery {
     per_page: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DownloadForm {
+    token: String,
+}
+
 pub(super) async fn list_history(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HistoryQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
@@ -46,6 +57,7 @@ pub(super) async fn list_history(
     let mut rows = sqlx::query_as::<_, BackupHistory>(
         r#"
         SELECT id, config_id, status, file_name, file_size, file_path,
+               (status = 'success' AND file_path IS NOT NULL) AS is_downloadable,
                error_message, started_at, completed_at, triggered_by
         FROM backup_history
         WHERE ($1::uuid IS NULL OR config_id = $1)
@@ -76,10 +88,14 @@ async fn get_history(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     let row = sqlx::query_as::<_, BackupHistory>(
         r#"
         SELECT id, config_id, status, file_name, file_size, file_path,
+               (status = 'success' AND file_path IS NOT NULL) AS is_downloadable,
                error_message, started_at, completed_at, triggered_by
         FROM backup_history WHERE id = $1
         "#,
@@ -96,10 +112,30 @@ async fn download_history(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Response> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
+    build_download_response(&state, id).await
+}
+
+async fn download_history_form(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Form(form): Form<DownloadForm>,
+) -> AppResult<Response> {
+    state
+        .auth
+        .authorize_token_active(&form.token, &state.config, &state.db)
+        .await?;
+    build_download_response(&state, id).await
+}
+
+async fn build_download_response(state: &AppState, id: Uuid) -> AppResult<Response> {
     let row = sqlx::query_as::<_, BackupHistory>(
         r#"
         SELECT id, config_id, status, file_name, file_size, file_path,
+               (status = 'success' AND file_path IS NOT NULL) AS is_downloadable,
                error_message, started_at, completed_at, triggered_by
         FROM backup_history WHERE id = $1
         "#,

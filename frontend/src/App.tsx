@@ -413,8 +413,8 @@ function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin:
         </div>
         <h1>{t('login.title')}</h1>
         <form onSubmit={submit}>
-          <label>{t('login.username')}<input value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-          <label>{t('login.password')}<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          <label>{t('login.username')}<input maxLength={100} value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+          <label>{t('login.password')}<input type="password" maxLength={72} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
           {error && <div className="alert">{error}</div>}
           <button disabled={loading}>{loading ? t('login.loading') : t('login.submit')}</button>
         </form>
@@ -433,6 +433,7 @@ function Dashboard({ stats, configs, history }: { stats: DashboardStats | null; 
       <Metric title={t('dashboard.success')} value={stats?.success_count ?? 0} />
       <Metric title={t('dashboard.failed')} value={stats?.failed_count ?? 0} />
       <Metric title={t('dashboard.storage')} value={formatBytes(stats?.storage_bytes)} />
+      <Metric title={t('dashboard.pendingCleanup')} value={stats?.pending_file_deletions ?? 0} />
       <div className="panel wide">
         <h2>{t('dashboard.recentBackups')}</h2>
         <HistoryTable history={latest} configs={configs} compact />
@@ -701,10 +702,19 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
     if (!deleteTarget) return;
     try {
       await api.deleteConfig(deleteTarget.id);
-      setDeleteTarget(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('error.deleteConfigFailed');
+      setError(message);
+      throw err instanceof Error ? err : new Error(message);
+    }
+
+    // Once DELETE commits, close the confirmation independently from the best-effort refresh.
+    // A later refresh error must not make the dialog claim that deletion itself failed.
+    setDeleteTarget(null);
+    try {
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('error.deleteConfigFailed'));
+      setError(err instanceof Error ? err.message : t('error.loadFailed'));
     }
   }
 
@@ -749,7 +759,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
       </div>
 
       {filtered.length > 0 ? (
-        <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+        <div className="panel config-table-panel">
           <div className="table-wrap config-table-wrap">
             <table className="config-table">
               <thead>
@@ -961,32 +971,61 @@ function TimeFields({ time, label, minuteOnly = false, onChange }: { time: strin
   );
 }
 
-function DeleteConfigDialog({ config, onCancel, onConfirm }: { config: BackupConfig | null; onCancel: () => void; onConfirm: () => Promise<void> }) {
+export function DeleteConfigDialog({ config, onCancel, onConfirm }: { config: BackupConfig | null; onCancel: () => void; onConfirm: () => Promise<void> }) {
   const { t } = useLanguage();
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
+    setSubmitting(false);
+    setSubmitError(null);
     if (config && !dialog.open) dialog.showModal();
     if (!config && dialog.open) dialog.close();
   }, [config]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await onConfirm();
+    if (submitting) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      await onConfirm();
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : t('error.deleteConfigFailed'));
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
-    <dialog className="schedule-dialog confirm-dialog" ref={dialogRef} onClose={onCancel} aria-labelledby="delete-config-title">
+    <dialog
+      className="schedule-dialog confirm-dialog"
+      ref={dialogRef}
+      onCancel={(event) => {
+        if (submitting) {
+          event.preventDefault();
+          return;
+        }
+        onCancel();
+      }}
+      onClose={onCancel}
+      aria-labelledby="delete-config-title"
+      aria-describedby="delete-config-description"
+    >
       <form className="schedule-form" onSubmit={submit}>
         <div>
           <h2 id="delete-config-title">{t('configs.delete.title')}</h2>
-          <p className="muted">{t('configs.delete.description', { name: config?.name ?? '' })}</p>
+          <p id="delete-config-description" className="muted">{t('configs.delete.description', { name: config?.name ?? '' })}</p>
+          {submitError && <p className="alert" role="alert">{submitError}</p>}
         </div>
         <div className="modal-actions">
-          <button type="button" className="ghost" onClick={onCancel}>{t('configs.delete.cancel')}</button>
-          <button type="submit" className="danger">{t('configs.delete.confirm')}</button>
+          <button type="button" className="ghost" disabled={submitting} onClick={onCancel}>{t('configs.delete.cancel')}</button>
+          <button type="submit" className="danger" disabled={submitting}>
+            {submitting ? t('configs.delete.deleting') : t('configs.delete.confirm')}
+          </button>
         </div>
       </form>
     </dialog>
@@ -1119,7 +1158,7 @@ const HistoryTable = React.memo(function HistoryTable({ history, configs, compac
               <td>{row.triggered_by}</td>
               <td>{formatBytes(row.file_size)}</td>
               <td>{new Date(row.started_at).toLocaleString()}</td>
-              {!compact && <td><div className="history-actions"><button className="ghost" onClick={() => onInspect?.(row)}>{t('history.viewFlow')}</button>{row.status === 'success' && <button onClick={() => onDownload?.(row.id)}>{t('history.download')}</button>}</div></td>}
+              {!compact && <td><div className="history-actions"><button className="ghost" onClick={() => onInspect?.(row)}>{t('history.viewFlow')}</button>{row.is_downloadable && <button onClick={() => onDownload?.(row.id)}>{t('history.download')}</button>}</div></td>}
             </tr>
           ))}
         </tbody>
@@ -1160,8 +1199,8 @@ function Users({ api, users, refresh, setError, currentUser }: { api: ApiClient;
     <section className="two-column narrow">
       <form className="panel form" onSubmit={submit}>
         <h2>{t('users.createAdmin')}</h2>
-        <label>{t('users.username')}<input required value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-        <label>{t('users.password')}<input required type="password" minLength={12} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        <label>{t('users.username')}<input required maxLength={100} value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+        <label>{t('users.password')}<input required type="password" minLength={12} maxLength={72} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
         <button>{t('users.create')}</button>
       </form>
       <div className="panel">

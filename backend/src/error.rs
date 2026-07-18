@@ -25,6 +25,8 @@ pub enum AppError {
     Conflict(String),
     #[error("backup timed out")]
     BackupTimeout,
+    #[error("backup output is sealed but its database commit is pending recovery: {0}")]
+    BackupCommitPending(String),
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -64,7 +66,7 @@ impl IntoResponse for AppError {
                 "BACKUP_TIMEOUT",
                 self.to_string(),
             ),
-            Self::Internal(_) => (
+            Self::Internal(_) | Self::BackupCommitPending(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "internal error".to_string(),

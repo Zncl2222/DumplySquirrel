@@ -73,7 +73,10 @@ pub(super) async fn list_configs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     let configs = sqlx::query_as::<_, BackupConfig>(
         r#"
         SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
@@ -99,7 +102,10 @@ pub(super) async fn create_config(
     headers: HeaderMap,
     Json(payload): Json<BackupConfigRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let auth = state.auth.authorize(&headers, &state.config)?;
+    let auth = state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     validate_payload(&payload)?;
     let db_url = payload
         .db_url
@@ -162,7 +168,10 @@ async fn update_config(
     Path(id): Path<Uuid>,
     Json(payload): Json<BackupConfigRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     validate_payload(&payload)?;
 
     let existing = sqlx::query_as::<_, BackupConfig>(
@@ -257,12 +266,37 @@ async fn delete_config(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
+    delete_config_records(&state.db, id).await?;
+    if let Err(err) = state.scheduler.remove_config(id).await {
+        // The database is authoritative. A stale in-memory job will only observe NotFound,
+        // while returning an error here would incorrectly imply that deletion was rolled back.
+        tracing::warn!(config_id = %id, error = ?err, "config deleted but scheduler cleanup failed");
+    }
+    Ok(Json(json!({ "data": { "deleted": true } })))
+}
+
+async fn delete_config_records(pool: &sqlx::PgPool, id: Uuid) -> AppResult<()> {
+    let mut transaction = pool.begin().await?;
+    // Backup preparation takes the same lock through creation of its running history.
+    // Once this lock is acquired, the running check and delete are one atomic decision.
+    let exists: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM backup_configs WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    if exists.is_none() {
+        return Err(AppError::NotFound);
+    }
+
     let running: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM backup_history WHERE config_id = $1 AND status = 'running' LIMIT 1",
     )
     .bind(id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *transaction)
     .await?;
     if running.is_some() {
         return Err(AppError::Conflict(
@@ -270,23 +304,30 @@ async fn delete_config(
         ));
     }
 
-    let backup_files = sqlx::query_scalar::<_, String>(
-        "SELECT file_path FROM backup_history WHERE config_id = $1 AND file_path IS NOT NULL",
+    sqlx::query(
+        r#"
+        INSERT INTO pending_file_deletions (id, file_path)
+        SELECT gen_random_uuid(), file_path
+        FROM backup_history
+        WHERE config_id = $1
+          AND file_path IS NOT NULL
+          AND btrim(file_path) <> ''
+        ON CONFLICT (file_path) DO NOTHING
+        "#,
     )
     .bind(id)
-    .fetch_all(&state.db)
+    .execute(&mut *transaction)
     .await?;
 
     let result = sqlx::query("DELETE FROM backup_configs WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *transaction)
         .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
-    state.scheduler.remove_config(id).await?;
-    cleanup_deleted_config_files(&state, backup_files).await;
-    Ok(Json(json!({ "data": { "deleted": true } })))
+    transaction.commit().await?;
+    Ok(())
 }
 
 async fn toggle_config(
@@ -295,7 +336,10 @@ async fn toggle_config(
     Path(id): Path<Uuid>,
     Json(payload): Json<ToggleRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     let config = sqlx::query_as::<_, BackupConfig>(
         r#"
         UPDATE backup_configs SET is_enabled = $2, updated_at = now()
@@ -321,15 +365,10 @@ async fn trigger_config(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
-    let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM backup_configs WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
         .await?;
-    if exists.is_none() {
-        return Err(AppError::NotFound);
-    }
-
     let history =
         backup_executor::spawn_backup(state.backup_runtime.clone(), id, BackupTrigger::Manual)
             .await?;
@@ -483,29 +522,5 @@ fn validate_db_version(db_type: &str, version: Option<&str>) -> AppResult<()> {
     }
 }
 
-async fn cleanup_deleted_config_files(state: &AppState, file_paths: Vec<String>) {
-    let Ok(backup_dir) = tokio::fs::canonicalize(&state.config.backup_dir).await else {
-        tracing::warn!(path = %state.config.backup_dir.display(), "cannot canonicalize backup dir for config file cleanup");
-        return;
-    };
-
-    for file_path in file_paths {
-        let path = std::path::PathBuf::from(&file_path);
-        match tokio::fs::canonicalize(&path).await {
-            Ok(canonical_path) if canonical_path.starts_with(&backup_dir) => {
-                if let Err(err) = tokio::fs::remove_file(&canonical_path).await {
-                    if err.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(path = %canonical_path.display(), error = ?err, "failed to remove deleted config backup file");
-                    }
-                }
-            }
-            Ok(canonical_path) => {
-                tracing::warn!(path = %canonical_path.display(), "skipped deleted config file outside backup dir");
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                tracing::warn!(path = %file_path, error = ?err, "failed to canonicalize deleted config backup file");
-            }
-        }
-    }
-}
+#[cfg(test)]
+mod tests;

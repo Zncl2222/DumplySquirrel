@@ -22,6 +22,7 @@
     "success": "Success",
     "failed": "Failed",
     "storage": "Storage",
+    "pendingCleanup": "Files pending cleanup",
     "recentBackups": "Recent Backups"
   },
   "configs": {
@@ -120,9 +121,10 @@
     },
     "delete": {
       "title": "Delete backup config?",
-      "description": "This will delete the config \"{name}\". Automatic backups will no longer follow this schedule.",
+      "description": "This permanently deletes \"{name}\" and all run history. Managed backup files are queued for background deletion and retried if cleanup fails. This action cannot be undone.",
       "cancel": "Cancel",
-      "confirm": "Confirm Delete"
+      "confirm": "Delete Permanently",
+      "deleting": "Deleting…"
     }
   },
   "history": {

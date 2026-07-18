@@ -11,7 +11,7 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
       - id: check-json
-        exclude: ^frontend/(node_modules|dist)/
+        exclude: ^(frontend/(node_modules|dist)/|\.devcontainer/.*\.json$)
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict

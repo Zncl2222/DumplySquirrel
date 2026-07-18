@@ -42,6 +42,48 @@ describe('ApiClient', () => {
 
     await expect(new ApiClient('bad-token').me()).rejects.toThrow('unauthorized');
   });
+
+  it('submits downloads natively instead of buffering the backup as a Blob', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    let submission: Record<string, string | null> | undefined;
+    const submit = vi
+      .spyOn(HTMLFormElement.prototype, 'submit')
+      .mockImplementation(function captureSubmission(this: HTMLFormElement) {
+        submission = {
+          action: this.getAttribute('action'),
+          method: this.method,
+          target: this.target,
+          token: new FormData(this).get('token')?.toString() ?? null,
+        };
+      });
+
+    await new ApiClient('stream-token').downloadHistory('history/one');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/backup-history/history%2Fone/download', {
+      method: 'HEAD',
+      headers: { Authorization: 'Bearer stream-token' },
+    });
+    expect(submission).toEqual({
+      action: '/api/backup-history/history%2Fone/download',
+      method: 'post',
+      target: 'dumply-backup-download',
+      token: 'stream-token',
+    });
+    expect(document.querySelector('form')).toBeNull();
+    document.querySelector('iframe[name="dumply-backup-download"]')?.remove();
+    submit.mockRestore();
+  });
+
+  it('surfaces a failed download preflight without submitting a hidden form', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 404 })));
+    const submit = vi.spyOn(HTMLFormElement.prototype, 'submit');
+
+    await expect(new ApiClient('stream-token').downloadHistory('missing')).rejects.toThrow(
+      'Request failed with 404',
+    );
+    expect(submit).not.toHaveBeenCalled();
+  });
 });
 
 describe('cronToHuman', () => {

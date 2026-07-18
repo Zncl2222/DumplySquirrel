@@ -5,10 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
 
 if [ -f "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/scripts/load-env.sh" "$ENV_FILE"
 fi
 
 : "${DB_PASSWORD:?missing DB_PASSWORD in .env}"
@@ -29,10 +27,12 @@ fi
 
 docker compose -f "$ROOT_DIR/docker-compose.dev.yml" stop backend >/dev/null 2>&1 || true
 
-export DATABASE_URL="postgres://dumply:${DB_PASSWORD}@127.0.0.1:${DEV_POSTGRES_PORT}/${DEV_DB_NAME}"
+db_password_url_encoded="${DB_PASSWORD_URL_ENCODED:-$DB_PASSWORD}"
+export DATABASE_URL="postgres://dumply:${db_password_url_encoded}@127.0.0.1:${DEV_POSTGRES_PORT}/${DEV_DB_NAME}"
 export BIND_ADDR="${DEV_BACKEND_BIND_ADDR:-127.0.0.1:${DEV_BACKEND_PORT}}"
 export BACKUP_DIR="$DEV_BACKUP_DIR"
 export RUST_LOG="${DEV_RUST_LOG:-debug}"
 export CORS_ALLOWED_ORIGIN="${DEV_CORS_ALLOWED_ORIGIN:-}"
+export ALLOW_INSECURE_DEV_SECRETS="${DEV_ALLOW_INSECURE_SECRETS:-false}"
 
 exec cargo run --manifest-path "$ROOT_DIR/backend/Cargo.toml" "$@"

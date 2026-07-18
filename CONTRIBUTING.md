@@ -46,6 +46,8 @@ Frontend checks:
 ```bash
 cd frontend
 npm ci
+npm audit --audit-level=high
+npm test
 npm run build
 ```
 

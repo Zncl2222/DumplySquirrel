@@ -1,4 +1,11 @@
-use std::{fs::File, io, path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    path::{Component, Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::Utc;
 use percent_encoding::percent_decode_str;
@@ -56,8 +63,7 @@ pub async fn spawn_backup(
     config_id: Uuid,
     trigger: BackupTrigger,
 ) -> AppResult<BackupHistory> {
-    let config = load_config(&runtime.db, config_id).await?;
-    let history = create_running_history(&runtime.db, config_id, trigger).await?;
+    let (config, history) = prepare_backup(&runtime.db, config_id, trigger).await?;
     let history_id = history.id;
 
     tokio::spawn(async move {
@@ -69,8 +75,15 @@ pub async fn spawn_backup(
     Ok(history)
 }
 
-async fn load_config(pool: &PgPool, config_id: Uuid) -> AppResult<BackupConfig> {
-    Ok(sqlx::query_as::<_, BackupConfig>(
+async fn prepare_backup(
+    pool: &PgPool,
+    config_id: Uuid,
+    trigger: BackupTrigger,
+) -> AppResult<(BackupConfig, BackupHistory)> {
+    let mut transaction = pool.begin().await?;
+    // Deletion takes the same parent-row lock before checking running histories.
+    // Keeping it through this insert makes either operation observe the other's result.
+    let config = sqlx::query_as::<_, BackupConfig>(
         r#"
         SELECT id, name, db_type, db_version, db_url_encrypted, db_url_nonce, cron_schedule,
                is_enabled, retention_days, timeout_seconds, max_backups,
@@ -78,23 +91,19 @@ async fn load_config(pool: &PgPool, config_id: Uuid) -> AppResult<BackupConfig> 
                created_by, created_at, updated_at
         FROM backup_configs
         WHERE id = $1
+        FOR UPDATE
         "#,
     )
     .bind(config_id)
-    .fetch_one(pool)
-    .await?)
-}
+    .fetch_one(&mut *transaction)
+    .await?;
 
-async fn create_running_history(
-    pool: &PgPool,
-    config_id: Uuid,
-    trigger: BackupTrigger,
-) -> AppResult<BackupHistory> {
     let result = sqlx::query_as::<_, BackupHistory>(
         r#"
         INSERT INTO backup_history (id, config_id, status, started_at, triggered_by)
         VALUES ($1, $2, 'running', $3, $4)
         RETURNING id, config_id, status, file_name, file_size, file_path,
+                  false AS is_downloadable,
                   error_message, started_at, completed_at, triggered_by
         "#,
     )
@@ -102,16 +111,19 @@ async fn create_running_history(
     .bind(config_id)
     .bind(Utc::now())
     .bind(trigger.as_str())
-    .fetch_one(pool)
+    .fetch_one(&mut *transaction)
     .await;
 
-    match result {
-        Ok(history) => Ok(history),
+    let history = match result {
+        Ok(history) => history,
         Err(sqlx::Error::Database(err)) if err.code().as_deref() == Some("23505") => Err(
             AppError::Conflict("backup is already running for this config".into()),
-        ),
-        Err(err) => Err(err.into()),
-    }
+        )?,
+        Err(err) => return Err(err.into()),
+    };
+
+    transaction.commit().await?;
+    Ok((config, history))
 }
 
 async fn run_backup(
@@ -187,6 +199,11 @@ async fn run_backup(
             .await;
         }
         Err(err) => {
+            if matches!(err, AppError::BackupCommitPending(_)) {
+                // The final file is the durable commit marker. Keep the row running so startup
+                // recovery can commit it; marking failure here would orphan a valid backup.
+                return Err(err);
+            }
             let status = if matches!(err, AppError::BackupTimeout) {
                 "timeout"
             } else {
@@ -206,6 +223,110 @@ async fn run_backup(
     }
 
     Ok(())
+}
+
+const RESTART_INTERRUPTION_MESSAGE: &str =
+    "Backup interrupted because the service restarted before completion.";
+const RESTART_COMMIT_MESSAGE: &str =
+    "Backup file was already finalized; startup recovery committed the run successfully.";
+
+/// Marks runs abandoned by a previous process as terminal before the scheduler starts.
+///
+/// New workers persist both their random partial path and intended final file name while they
+/// are running. Keeping those two values lets recovery cover a crash on either side of the
+/// atomic rename. The directory sweep also removes recognizable partial files from older runs
+/// whose history row was never updated.
+pub async fn recover_interrupted_backups(runtime: &BackupRuntime) -> AppResult<u64> {
+    tokio::fs::create_dir_all(&runtime.config.backup_dir)
+        .await
+        .map_err(|err| AppError::Internal(err.into()))?;
+
+    let interrupted = sqlx::query_as::<_, InterruptedBackup>(
+        r#"
+        SELECT id, file_name, file_path
+        FROM backup_history
+        WHERE status = 'running'
+        ORDER BY started_at
+        "#,
+    )
+    .fetch_all(&runtime.db)
+    .await?;
+
+    let mut recovered = 0_u64;
+    let mut committed = 0_u64;
+    for backup in &interrupted {
+        // A successful atomic rename is the durable commit marker. Inspect it before removing
+        // anything so a crash between rename and the normal database update is recovered as a
+        // successful backup rather than deleting the completed artifact.
+        let finalized = find_durable_final_output(&runtime.config.backup_dir, backup)
+            .await
+            .map_err(|err| AppError::Internal(err.into()))?;
+        // Finish partial-file cleanup before the compare-and-set. If recovery itself stops here,
+        // the still-running row and durable final file make the decision repeatable next start.
+        cleanup_interrupted_partial(&runtime.config.backup_dir, backup)
+            .await
+            .map_err(|err| AppError::Internal(err.into()))?;
+
+        let (result, event_level, event_message) = match finalized {
+            Some(finalized) => {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE backup_history
+                    SET status = 'success', error_message = NULL, completed_at = now(),
+                        file_path = $2, file_size = $3
+                    WHERE id = $1 AND status = 'running'
+                    "#,
+                )
+                .bind(backup.id)
+                .bind(finalized.path.to_string_lossy().to_string())
+                .bind(finalized.size)
+                .execute(&runtime.db)
+                .await?;
+                (result, "success", RESTART_COMMIT_MESSAGE)
+            }
+            None => {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE backup_history
+                    SET status = 'failed', error_message = $2, completed_at = now(),
+                        file_path = NULL, file_size = NULL
+                    WHERE id = $1 AND status = 'running'
+                    "#,
+                )
+                .bind(backup.id)
+                .bind(RESTART_INTERRUPTION_MESSAGE)
+                .execute(&runtime.db)
+                .await?;
+                (result, "error", RESTART_INTERRUPTION_MESSAGE)
+            }
+        };
+        if result.rows_affected() == 1 {
+            recovered += 1;
+            if event_level == "success" {
+                committed += 1;
+            }
+            backup_event(
+                &runtime.db,
+                backup.id,
+                "interrupted",
+                event_level,
+                event_message,
+            )
+            .await;
+        }
+    }
+
+    sweep_partial_outputs(&runtime.config.backup_dir).await;
+
+    if recovered > 0 {
+        tracing::warn!(
+            count = recovered,
+            committed,
+            failed = recovered - committed,
+            "recovered backup runs interrupted by a previous process"
+        );
+    }
+    Ok(recovered)
 }
 
 async fn execute_backup(
@@ -243,8 +364,21 @@ async fn execute_backup(
         ),
     )
     .await;
-    let file_name = format!("{}_{}.sql", config.id, Utc::now().format("%Y%m%d_%H%M%S"));
+    let file_name = format!(
+        "{}_{}_{}.sql",
+        config.id,
+        Utc::now().format("%Y%m%d_%H%M%S"),
+        history_id
+    );
     let output_path = runtime.config.backup_dir.join(&file_name);
+    let (partial_path, output_file) =
+        reserve_partial_output(&runtime.config.backup_dir, history_id)?;
+    if let Err(err) =
+        record_pending_output(&runtime.db, history_id, &file_name, &partial_path).await
+    {
+        cleanup_partial_file(&partial_path).await;
+        return Err(err);
+    }
     backup_event(
         &runtime.db,
         history_id,
@@ -260,7 +394,7 @@ async fn execute_backup(
                 &runtime.db,
                 history_id,
                 &target,
-                &output_path,
+                output_file,
                 config.db_version.as_deref(),
                 config.timeout_seconds,
             )
@@ -271,7 +405,7 @@ async fn execute_backup(
                 &runtime.db,
                 history_id,
                 &target,
-                &output_path,
+                output_file,
                 config.db_version.as_deref(),
                 config.timeout_seconds,
             )
@@ -282,10 +416,28 @@ async fn execute_backup(
 
     match dump_result {
         Ok(()) => {
-            let file_size = tokio::fs::metadata(&output_path)
-                .await
-                .map_err(|err| AppError::Internal(err.into()))?
-                .len() as i64;
+            if let Err(err) = finalize_partial_output(&partial_path, &output_path).await {
+                if matches!(err, AppError::BackupCommitPending(_)) {
+                    // Rename succeeded, but its directory entry was not proven durable. Leave
+                    // the row running so startup recovery decides from the actual final file.
+                    backup_event(&runtime.db, history_id, "seal", "warning", &err.to_string())
+                        .await;
+                    return Err(err);
+                }
+                cleanup_partial_file(&partial_path).await;
+                backup_event(&runtime.db, history_id, "seal", "error", &err.to_string()).await;
+                mark_failed(&runtime.db, history_id, "failed", &err.to_string(), None).await?;
+                return Err(err);
+            }
+            let file_size = match tokio::fs::metadata(&output_path).await {
+                Ok(metadata) => metadata.len() as i64,
+                Err(source) => {
+                    return Err(AppError::BackupCommitPending(format!(
+                        "failed to inspect finalized output {}: {source}",
+                        output_path.display()
+                    )));
+                }
+            };
             backup_event(
                 &runtime.db,
                 history_id,
@@ -294,7 +446,17 @@ async fn execute_backup(
                 &format!("Backup file sealed at {file_size} bytes."),
             )
             .await;
-            mark_success(&runtime.db, history_id, &file_name, &output_path, file_size).await?;
+            if let Err(err) = mark_success_with_retry(
+                &runtime.db,
+                history_id,
+                &file_name,
+                &output_path,
+                file_size,
+            )
+            .await
+            {
+                return Err(AppError::BackupCommitPending(err.to_string()));
+            }
             backup_event(
                 &runtime.db,
                 history_id,
@@ -303,7 +465,31 @@ async fn execute_backup(
                 "Applying retention rules.",
             )
             .await;
-            apply_retention(runtime, config).await?;
+            match apply_retention(runtime, config.id).await {
+                Ok(()) => {
+                    backup_event(
+                        &runtime.db,
+                        history_id,
+                        "retention",
+                        "success",
+                        "Retention rules applied.",
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(history_id = %history_id, error = ?err, "retention maintenance failed");
+                    backup_event(
+                        &runtime.db,
+                        history_id,
+                        "retention",
+                        "warning",
+                        &format!(
+                            "Backup is valid, but retention maintenance failed and should be retried: {err}"
+                        ),
+                    )
+                    .await;
+                }
+            }
             backup_event(
                 &runtime.db,
                 history_id,
@@ -315,7 +501,7 @@ async fn execute_backup(
             Ok(BackupFinalStatus::Success)
         }
         Err(AppError::BackupTimeout) => {
-            cleanup_partial_file(&output_path).await;
+            cleanup_partial_file(&partial_path).await;
             backup_event(
                 &runtime.db,
                 history_id,
@@ -335,7 +521,7 @@ async fn execute_backup(
             Ok(BackupFinalStatus::Timeout)
         }
         Err(err) => {
-            cleanup_partial_file(&output_path).await;
+            cleanup_partial_file(&partial_path).await;
             backup_event(&runtime.db, history_id, "failed", "error", &err.to_string()).await;
             mark_failed(&runtime.db, history_id, "failed", &err.to_string(), None).await?;
             Err(err)
@@ -343,11 +529,124 @@ async fn execute_backup(
     }
 }
 
+fn reserve_partial_output(backup_dir: &Path, history_id: Uuid) -> AppResult<(PathBuf, File)> {
+    const MAX_ATTEMPTS: usize = 4;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let path = partial_output_path(backup_dir, history_id);
+        match open_new_output_file(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(AppError::Internal(err.into())),
+        }
+    }
+
+    Err(AppError::Internal(anyhow::anyhow!(
+        "failed to reserve a unique partial backup file"
+    )))
+}
+
+fn partial_output_path(backup_dir: &Path, history_id: Uuid) -> PathBuf {
+    backup_dir.join(format!(".dumply-{history_id}-{}.part", Uuid::new_v4()))
+}
+
+fn open_new_output_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options.open(path)
+}
+
+async fn record_pending_output(
+    pool: &PgPool,
+    history_id: Uuid,
+    file_name: &str,
+    partial_path: &Path,
+) -> AppResult<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE backup_history
+        SET file_name = $2, file_path = $3
+        WHERE id = $1 AND status = 'running'
+        "#,
+    )
+    .bind(history_id)
+    .bind(file_name)
+    .bind(partial_path.to_string_lossy().to_string())
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(AppError::Conflict(
+            "backup is no longer in a running state".into(),
+        ))
+    }
+}
+
+async fn finalize_partial_output(partial_path: &Path, output_path: &Path) -> AppResult<()> {
+    match tokio::fs::symlink_metadata(output_path).await {
+        Ok(_) => {
+            return Err(AppError::Conflict(format!(
+                "backup output already exists at {}",
+                output_path.display()
+            )))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(AppError::Internal(err.into())),
+    }
+
+    let partial_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(partial_path)
+        .await
+        .map_err(|err| AppError::Internal(err.into()))?;
+    partial_file
+        .sync_all()
+        .await
+        .map_err(|err| AppError::Internal(err.into()))?;
+    drop(partial_file);
+
+    tokio::fs::rename(partial_path, output_path)
+        .await
+        .map_err(|err| AppError::Internal(err.into()))?;
+
+    #[cfg(unix)]
+    {
+        let parent = output_path.parent().ok_or_else(|| {
+            AppError::BackupCommitPending(format!(
+                "finalized output has no parent directory: {}",
+                output_path.display()
+            ))
+        })?;
+        let directory = tokio::fs::File::open(parent).await.map_err(|source| {
+            AppError::BackupCommitPending(format!(
+                "failed to open backup directory {} after finalizing output: {source}",
+                parent.display()
+            ))
+        })?;
+        directory.sync_all().await.map_err(|source| {
+            AppError::BackupCommitPending(format!(
+                "failed to sync backup directory {} after finalizing output: {source}",
+                parent.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 async fn run_pg_dump(
     pool: &PgPool,
     history_id: Uuid,
     target: &DumpTarget,
-    output_path: &Path,
+    output: File,
     configured_version: Option<&str>,
     timeout_seconds: i32,
 ) -> AppResult<()> {
@@ -397,7 +696,6 @@ async fn run_pg_dump(
         &format!("Using `{command_path}` for PostgreSQL {major_version}."),
     )
     .await;
-    let output = File::create(output_path).map_err(|err| AppError::Internal(err.into()))?;
     let mut command = Command::new(&command_path);
     command
         .arg("-h")
@@ -431,7 +729,7 @@ async fn run_mysqldump(
     pool: &PgPool,
     history_id: Uuid,
     target: &DumpTarget,
-    output_path: &Path,
+    output: File,
     configured_version: Option<&str>,
     timeout_seconds: i32,
 ) -> AppResult<()> {
@@ -481,11 +779,11 @@ async fn run_mysqldump(
     )
     .await;
     let option_file = mysql_option_file(target)?;
-    let output = File::create(output_path).map_err(|err| AppError::Internal(err.into()))?;
     let option_path = option_file.path().to_path_buf();
     let mut command = Command::new("mysqldump");
     command
         .arg(format!("--defaults-extra-file={}", option_path.display()))
+        .arg("--")
         .arg(&target.database)
         .stdout(Stdio::from(output))
         .stderr(Stdio::piped());
@@ -591,35 +889,42 @@ async fn run_command_output(
     mut command: Command,
     timeout_seconds: i32,
 ) -> AppResult<String> {
-    let output = match tokio::time::timeout(
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_child_process(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|err| command_spawn_error(command_name, err))?;
+    let mut stdout_task = tokio::spawn(read_stream(child.stdout.take()));
+    let mut stderr_task = tokio::spawn(read_stream(child.stderr.take()));
+    let status = match tokio::time::timeout(
         Duration::from_secs(timeout_seconds.max(1) as u64),
-        command.output(),
+        child.wait(),
     )
     .await
     {
-        Ok(result) => result.map_err(|err| {
-            if err.kind() == io::ErrorKind::NotFound {
-                AppError::Internal(anyhow::anyhow!(
-                    "missing required dump command `{command_name}` in PATH"
-                ))
-            } else {
-                AppError::Internal(anyhow::anyhow!("failed to run `{command_name}`: {err}"))
-            }
-        })?,
-        Err(_) => return Err(AppError::BackupTimeout),
+        Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
+        Err(_) => {
+            terminate_child_process(&mut child).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(AppError::BackupTimeout);
+        }
     };
+    let stdout = finish_output_reader(&mut stdout_task, command_name, "stdout").await;
+    let stderr = finish_output_reader(&mut stderr_task, command_name, "stderr").await;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !status.success() {
         let message = if stderr.trim().is_empty() {
-            format!("dump command exited with status {}", output.status)
+            format!("dump command exited with status {status}")
         } else {
             stderr
         };
         return Err(AppError::Internal(anyhow::anyhow!(message)));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(stdout)
 }
 
 fn postgres_major_from_server_version_num(version_num: &str) -> AppResult<String> {
@@ -664,31 +969,37 @@ async fn run_command(
     mut command: Command,
     timeout_seconds: i32,
 ) -> AppResult<()> {
-    let mut child = command.spawn().map_err(|err| {
-        if err.kind() == io::ErrorKind::NotFound {
-            AppError::Internal(anyhow::anyhow!(
-                "missing required dump command `{command_name}` in PATH"
-            ))
-        } else {
-            AppError::Internal(anyhow::anyhow!("failed to spawn `{command_name}`: {err}"))
-        }
-    })?;
+    configure_child_process(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|err| command_spawn_error(command_name, err))?;
     let stderr = child.stderr.take();
-    let stderr_task = tokio::spawn(read_stderr(stderr));
+    let mut stderr_task = tokio::spawn(read_stderr(stderr));
 
     let status =
         match tokio::time::timeout(Duration::from_secs(timeout_seconds as u64), child.wait()).await
         {
             Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                terminate_child_process(&mut child).await;
+                stderr_task.abort();
                 let _ = stderr_task.await;
                 return Err(AppError::BackupTimeout);
             }
         };
 
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
+        Ok(result) => result.unwrap_or_default(),
+        Err(_) => {
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            tracing::warn!(
+                command = command_name,
+                "stderr pipe remained open after command exit"
+            );
+            String::new()
+        }
+    };
     if !status.success() {
         let message = if stderr.trim().is_empty() {
             format!("dump command exited with status {status}")
@@ -701,12 +1012,85 @@ async fn run_command(
     Ok(())
 }
 
+fn configure_child_process(command: &mut Command) {
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let parent_pid = unsafe { libc::getpid() };
+        unsafe {
+            command.as_std_mut().pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Close the small fork/prctl race if the backend exited before the signal was set.
+                if libc::getppid() != parent_pid {
+                    libc::raise(libc::SIGKILL);
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+fn command_spawn_error(command_name: &str, err: io::Error) -> AppError {
+    if err.kind() == io::ErrorKind::NotFound {
+        AppError::Internal(anyhow::anyhow!(
+            "missing required dump command `{command_name}` in PATH"
+        ))
+    } else {
+        AppError::Internal(anyhow::anyhow!("failed to spawn `{command_name}`: {err}"))
+    }
+}
+
+async fn terminate_child_process(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(process_id) = child.id() {
+        // Each command starts in its own process group, so a timeout also terminates descendants
+        // that inherited stdout/stderr and could otherwise keep the worker hung indefinitely.
+        unsafe {
+            libc::kill(-(process_id as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn finish_output_reader(
+    task: &mut tokio::task::JoinHandle<String>,
+    command_name: &str,
+    stream_name: &str,
+) -> String {
+    match tokio::time::timeout(Duration::from_secs(1), &mut *task).await {
+        Ok(result) => result.unwrap_or_default(),
+        Err(_) => {
+            task.abort();
+            tracing::warn!(
+                command = command_name,
+                stream = stream_name,
+                "command output pipe remained open after process exit"
+            );
+            String::new()
+        }
+    }
+}
+
 async fn read_stderr(stderr: Option<tokio::process::ChildStderr>) -> String {
-    let Some(stderr) = stderr else {
+    read_stream(stderr).await
+}
+
+async fn read_stream<R>(stream: Option<R>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let Some(stream) = stream else {
         return String::new();
     };
     let mut buffer = Vec::new();
-    let mut limited = stderr.take(64 * 1024);
+    let mut limited = stream.take(64 * 1024);
     if limited.read_to_end(&mut buffer).await.is_err() {
         return String::new();
     }
@@ -720,12 +1104,12 @@ async fn mark_success(
     output_path: &Path,
     file_size: i64,
 ) -> AppResult<()> {
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         UPDATE backup_history
         SET status = 'success', file_name = $2, file_size = $3, file_path = $4,
             completed_at = now(), error_message = NULL
-        WHERE id = $1
+        WHERE id = $1 AND status = 'running'
         "#,
     )
     .bind(history_id)
@@ -734,7 +1118,35 @@ async fn mark_success(
     .bind(output_path.to_string_lossy().to_string())
     .execute(pool)
     .await?;
-    Ok(())
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(AppError::Conflict(
+            "backup is no longer in a running state".into(),
+        ))
+    }
+}
+
+async fn mark_success_with_retry(
+    pool: &PgPool,
+    history_id: Uuid,
+    file_name: &str,
+    output_path: &Path,
+    file_size: i64,
+) -> AppResult<()> {
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match mark_success(pool, history_id, file_name, output_path, file_size).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.expect("mark_success retry loop must record an error"))
 }
 
 async fn mark_failed(
@@ -769,7 +1181,8 @@ async fn mark_failed_if_running(
     sqlx::query(
         r#"
         UPDATE backup_history
-        SET status = $2, error_message = $3, completed_at = now()
+        SET status = $2, error_message = $3, completed_at = now(),
+            file_path = NULL, file_size = NULL
         WHERE id = $1 AND status = 'running'
         "#,
     )
@@ -800,80 +1213,278 @@ async fn backup_event(pool: &PgPool, history_id: Uuid, stage: &str, level: &str,
     }
 }
 
-async fn apply_retention(runtime: &BackupRuntime, config: &BackupConfig) -> AppResult<()> {
-    let expired = sqlx::query_as::<_, RetentionCandidate>(
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Applies retention at startup and hourly, including disabled configs or configs whose recent
+/// backups keep failing and therefore never reach the normal post-success retention step.
+pub fn spawn_retention_worker(runtime: BackupRuntime) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RETENTION_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match sweep_all_retention(&runtime).await {
+                Ok((checked, failed)) => {
+                    tracing::info!(checked, failed, "periodic backup retention sweep completed");
+                }
+                Err(err) => {
+                    tracing::warn!(error = ?err, "periodic backup retention sweep failed");
+                }
+            }
+        }
+    })
+}
+
+async fn sweep_all_retention(runtime: &BackupRuntime) -> AppResult<(u64, u64)> {
+    let config_ids = sqlx::query_scalar::<_, Uuid>("SELECT id FROM backup_configs ORDER BY id")
+        .fetch_all(&runtime.db)
+        .await?;
+
+    let checked = config_ids.len() as u64;
+    let mut failed = 0_u64;
+    for config_id in config_ids {
+        if let Err(err) = apply_retention(runtime, config_id).await {
+            failed += 1;
+            tracing::warn!(%config_id, error = ?err, "retention sweep failed for config");
+        }
+    }
+    Ok((checked, failed))
+}
+
+async fn apply_retention(runtime: &BackupRuntime, config_id: Uuid) -> AppResult<()> {
+    let mut transaction = runtime.db.begin().await?;
+    // Serialize with config updates/deletion, then read the current policy. This prevents a
+    // worker that captured an older, stricter policy from deleting files after the user relaxed
+    // retention. File removal itself is delegated to the durable outbox after commit.
+    let settings = sqlx::query_as::<_, (i32, Option<i32>)>(
         r#"
-        SELECT id, file_path
-        FROM backup_history
-        WHERE config_id = $1
-          AND status = 'success'
-          AND file_path IS NOT NULL
-          AND completed_at < now() - ($2::int * interval '1 day')
+        SELECT retention_days, max_backups
+        FROM backup_configs
+        WHERE id = $1
+        FOR UPDATE
         "#,
     )
-    .bind(config.id)
-    .bind(config.retention_days)
-    .fetch_all(&runtime.db)
+    .bind(config_id)
+    .fetch_optional(&mut *transaction)
     .await?;
-    remove_retained_files(runtime, expired).await?;
+    let Some((retention_days, max_backups)) = settings else {
+        transaction.rollback().await?;
+        return Ok(());
+    };
 
-    if let Some(max_backups) = config.max_backups {
-        let overflow = sqlx::query_as::<_, RetentionCandidate>(
-            r#"
-            SELECT id, file_path
+    let queued = sqlx::query(
+        r#"
+        WITH ranked AS (
+            SELECT id, file_path, completed_at,
+                   row_number() OVER (
+                       ORDER BY completed_at DESC NULLS LAST, started_at DESC, id DESC
+                   ) AS backup_rank
             FROM backup_history
             WHERE config_id = $1
               AND status = 'success'
               AND file_path IS NOT NULL
-            ORDER BY completed_at DESC NULLS LAST
-            OFFSET $2
-            "#,
+        ),
+        candidates AS (
+            SELECT id, file_path
+            FROM ranked
+            WHERE completed_at < now() - ($2::int * interval '1 day')
+               OR ($3::int IS NOT NULL AND backup_rank > $3::bigint)
+        ),
+        enqueued AS (
+            INSERT INTO pending_file_deletions (id, file_path)
+            SELECT gen_random_uuid(), file_path
+            FROM candidates
+            ON CONFLICT (file_path) DO NOTHING
+            RETURNING file_path
         )
-        .bind(config.id)
-        .bind(max_backups as i64)
-        .fetch_all(&runtime.db)
-        .await?;
-        remove_retained_files(runtime, overflow).await?;
-    }
+        UPDATE backup_history AS history
+        SET file_path = NULL
+        FROM candidates
+        WHERE history.id = candidates.id
+          AND history.file_path = candidates.file_path
+        "#,
+    )
+    .bind(config_id)
+    .bind(retention_days)
+    .bind(max_backups)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    transaction.commit().await?;
 
+    if queued > 0 {
+        tracing::info!(%config_id, queued, "retained backup files queued for durable deletion");
+    }
     Ok(())
 }
 
-async fn remove_retained_files(
-    runtime: &BackupRuntime,
-    candidates: Vec<RetentionCandidate>,
-) -> AppResult<()> {
-    for candidate in candidates {
-        if let Some(file_path) = candidate.file_path {
-            match is_under_backup_dir(&runtime.config.backup_dir, Path::new(&file_path)).await {
-                Ok(true) => {
-                    if let Err(err) = tokio::fs::remove_file(&file_path).await {
-                        if err.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(path = %file_path, error = ?err, "failed to remove retained backup file");
-                            continue;
-                        }
-                    }
-                    sqlx::query("UPDATE backup_history SET file_path = NULL WHERE id = $1")
-                        .bind(candidate.id)
-                        .execute(&runtime.db)
-                        .await?;
-                }
-                Ok(false) => {
-                    tracing::warn!(path = %file_path, "skipped retention file outside backup dir")
-                }
-                Err(err) => {
-                    tracing::warn!(path = %file_path, error = ?err, "failed retention path check")
-                }
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedFileRemoval {
+    Removed,
+    Missing,
+    OutsideBackupDir,
+    NotAFile,
+}
+
+/// Removes only a direct child of the managed backup directory without following a final symlink.
+pub(crate) async fn remove_managed_file(
+    backup_dir: &Path,
+    path: &Path,
+) -> std::io::Result<ManagedFileRemoval> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(ManagedFileRemoval::Missing)
+        }
+        Err(err) => return Err(err),
+    };
+    let backup_dir = tokio::fs::canonicalize(backup_dir).await?;
+    let Some(parent) = path.parent() else {
+        return Ok(ManagedFileRemoval::OutsideBackupDir);
+    };
+    let parent = tokio::fs::canonicalize(parent).await?;
+    if parent != backup_dir {
+        return Ok(ManagedFileRemoval::OutsideBackupDir);
+    }
+    let file_type = metadata.file_type();
+    if !file_type.is_file() && !file_type.is_symlink() {
+        return Ok(ManagedFileRemoval::NotAFile);
+    }
+    tokio::fs::remove_file(path).await?;
+    Ok(ManagedFileRemoval::Removed)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableFinalOutput {
+    path: PathBuf,
+    size: i64,
+}
+
+/// Returns a completed output only when the recorded final name resolves to a direct regular
+/// child of the backup directory. `symlink_metadata` deliberately avoids following a final
+/// symlink: a symlink, directory, unsafe name, or missing path can never commit a run.
+async fn find_durable_final_output(
+    backup_dir: &Path,
+    backup: &InterruptedBackup,
+) -> std::io::Result<Option<DurableFinalOutput>> {
+    let Some(file_name) = backup.file_name.as_deref() else {
+        return Ok(None);
+    };
+    if !is_safe_final_file_name(file_name) {
+        tracing::warn!(
+            history_id = %backup.id,
+            file_name,
+            "interrupted backup has an unsafe final file name"
+        );
+        return Ok(None);
+    }
+
+    let path = backup_dir.join(file_name);
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if !metadata.file_type().is_file() {
+        tracing::warn!(
+            history_id = %backup.id,
+            path = %path.display(),
+            "interrupted backup final path is not a direct regular file"
+        );
+        return Ok(None);
+    }
+
+    let canonical_backup_dir = tokio::fs::canonicalize(backup_dir).await?;
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    if tokio::fs::canonicalize(parent).await? != canonical_backup_dir {
+        tracing::warn!(
+            history_id = %backup.id,
+            path = %path.display(),
+            "interrupted backup final path is outside the backup directory"
+        );
+        return Ok(None);
+    }
+
+    let size = i64::try_from(metadata.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("backup file is too large to record: {}", path.display()),
+        )
+    })?;
+    Ok(Some(DurableFinalOutput { path, size }))
+}
+
+async fn cleanup_interrupted_partial(
+    backup_dir: &Path,
+    backup: &InterruptedBackup,
+) -> std::io::Result<()> {
+    if let Some(partial_path) = backup.file_path.as_deref().map(Path::new) {
+        if partial_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".part"))
+        {
+            remove_recovery_file(backup_dir, partial_path).await?;
         }
     }
     Ok(())
 }
 
-async fn is_under_backup_dir(backup_dir: &Path, path: &Path) -> std::io::Result<bool> {
-    let backup_dir = tokio::fs::canonicalize(backup_dir).await?;
-    let path = tokio::fs::canonicalize(path).await?;
-    Ok(path.starts_with(backup_dir))
+fn is_safe_final_file_name(file_name: &str) -> bool {
+    let mut components = Path::new(file_name).components();
+    matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && file_name.ends_with(".sql")
+}
+
+async fn remove_recovery_file(backup_dir: &Path, path: &Path) -> std::io::Result<()> {
+    match remove_managed_file(backup_dir, path).await? {
+        ManagedFileRemoval::Removed | ManagedFileRemoval::Missing => {}
+        ManagedFileRemoval::OutsideBackupDir => {
+            tracing::warn!(path = %path.display(), "skipped interrupted file outside backup dir")
+        }
+        ManagedFileRemoval::NotAFile => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("interrupted backup path is not a file: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn sweep_partial_outputs(backup_dir: &Path) {
+    let mut entries = match tokio::fs::read_dir(backup_dir).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(path = %backup_dir.display(), error = ?err, "failed to scan partial backup files");
+            return;
+        }
+    };
+
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(path = %backup_dir.display(), error = ?err, "failed to read partial backup file entry");
+                break;
+            }
+        };
+        if !entry.file_name().to_string_lossy().ends_with(".part") {
+            continue;
+        }
+        match entry.file_type().await {
+            Ok(file_type) if file_type.is_file() || file_type.is_symlink() => {
+                cleanup_partial_file(&entry.path()).await
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(path = %entry.path().display(), error = ?err, "failed to inspect partial backup file");
+            }
+        }
+    }
 }
 
 async fn cleanup_partial_file(path: &Path) {
@@ -885,8 +1496,9 @@ async fn cleanup_partial_file(path: &Path) {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct RetentionCandidate {
+struct InterruptedBackup {
     id: Uuid,
+    file_name: Option<String>,
     file_path: Option<String>,
 }
 
@@ -916,6 +1528,11 @@ impl DumpTarget {
         if database.is_empty() {
             return Err(AppError::Validation(
                 "db_url database name is required".into(),
+            ));
+        }
+        if url.scheme() == "mysql" && database.starts_with('-') {
+            return Err(AppError::Validation(
+                "MySQL database name must not start with '-'".into(),
             ));
         }
 
@@ -959,9 +1576,12 @@ impl DumpTarget {
             self.password.as_deref().unwrap_or_default(),
             self.database.as_str(),
         ];
-        if values.iter().any(|value| value.contains(['\n', '\r'])) {
+        if values
+            .iter()
+            .any(|value| value.chars().any(char::is_control))
+        {
             return Err(AppError::Validation(
-                "db_url components must not contain newlines".into(),
+                "db_url components must not contain control characters".into(),
             ));
         }
         Ok(())
@@ -1003,14 +1623,28 @@ fn mysql_option_file(target: &DumpTarget) -> AppResult<NamedTempFile> {
     let mut file = NamedTempFile::new().map_err(|err| AppError::Internal(err.into()))?;
     let contents = format!(
         "[client]\nhost={}\nport={}\nuser={}\npassword={}\n",
-        target.host,
+        mysql_option_value(&target.host),
         target.port,
-        target.username,
-        target.password.as_deref().unwrap_or_default()
+        mysql_option_value(&target.username),
+        mysql_option_value(target.password.as_deref().unwrap_or_default())
     );
     std::io::Write::write_all(&mut file, contents.as_bytes())
         .map_err(|err| AppError::Internal(err.into()))?;
     Ok(file)
+}
+
+fn mysql_option_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            _ => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 #[cfg(test)]

@@ -11,7 +11,10 @@ async fn stats(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
 
     let total_configs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_configs")
         .fetch_one(&state.db)
@@ -29,10 +32,18 @@ async fn stats(
     .fetch_one(&state.db)
     .await?;
     let storage_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(file_size), 0)::BIGINT FROM backup_history WHERE status = 'success'",
+        r#"
+        SELECT COALESCE(SUM(file_size), 0)::BIGINT
+        FROM backup_history
+        WHERE status = 'success' AND file_path IS NOT NULL
+        "#,
     )
     .fetch_one(&state.db)
     .await?;
+    let pending_file_deletions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_file_deletions")
+            .fetch_one(&state.db)
+            .await?;
 
     Ok(Json(json!({
         "data": {
@@ -40,7 +51,8 @@ async fn stats(
             "total_backups": total_backups,
             "success_count": success_count,
             "failed_count": failed_count,
-            "storage_bytes": storage_bytes
+            "storage_bytes": storage_bytes,
+            "pending_file_deletions": pending_file_deletions
         }
     })))
 }

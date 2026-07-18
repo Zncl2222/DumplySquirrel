@@ -541,6 +541,11 @@ nav button:hover,
 
 /* ── Configs page: table-based layout ─────────────────────────── */
 
+.config-table-panel {
+  overflow: hidden;
+  padding: 0;
+}
+
 .configs-page {
   animation: fadeIn 0.35s ease;
 }

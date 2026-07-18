@@ -9,6 +9,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   pre-commit:
     name: Pre-commit
@@ -36,6 +39,20 @@ jobs:
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dumply_test
+          POSTGRES_USER: dumply_test
+          POSTGRES_PASSWORD: ci_test_password_strong
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dumply_test -d dumply_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: backend
@@ -62,6 +79,18 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features
 
+      - name: PostgreSQL integration tests
+        env:
+          TEST_DATABASE_URL: postgres://dumply_test:ci_test_password_strong@127.0.0.1:5432/dumply_test
+        run: |
+          cargo test --all-targets --all-features parent_row_lock_serializes_delete_and_trigger -- --ignored
+          cargo test --all-targets --all-features config_delete_uses_a_durable_file_deletion_outbox -- --ignored
+          cargo test --all-targets --all-features active_authorization_rejects_a_deleted_user_or_stale_token_version -- --ignored
+          cargo test --all-targets --all-features database_encryption_key_rotation_is_transactional_and_idempotent -- --ignored
+          cargo test --all-targets --all-features periodic_retention_sweeps_disabled_configs_without_a_new_success -- --ignored
+          cargo test --all-targets --all-features expired_instance_lease_holds_advisory_lock_until_shutdown -- --ignored
+          cargo test --all-targets --all-features instance_lease_blocks_takeover_after_advisory_session_loss -- --ignored
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -75,7 +104,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -84,6 +113,9 @@ jobs:
 
       - name: Audit dependencies
         run: npm audit --audit-level=high
+
+      - name: Test
+        run: npm test
 
       - name: Build
         run: npm run build
@@ -95,16 +127,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate Compose config
+      - name: Test environment helpers
+        run: |
+          bash scripts/test-init-env.sh
+          bash scripts/test-env-roundtrip.sh
+
+      - name: Validate Compose configs
         env:
           DB_PASSWORD: ci_db_password
           JWT_SECRET: ci_jwt_secret
           DATABASE_ENCRYPTION_KEY: ci_database_encryption_key_32_bytes
           ADMIN_PASSWORD: ci_admin_password
-        run: docker compose config
+        run: |
+          docker compose config >/dev/null
+          ENABLE_TLS=true docker compose -f docker-compose.yml -f docker-compose.tls.yml config >/dev/null
+          docker compose -f docker-compose.dev.yml config >/dev/null
 
       - name: Build backend image
         run: docker build -t dumply-backend:ci ./backend
 
       - name: Build frontend image
         run: docker build -t dumply-frontend:ci ./frontend
+
+      - name: Validate rendered HTTP Nginx config
+        run: >-
+          docker run --rm --add-host backend:127.0.0.1
+          -e ENABLE_TLS=false -e NGINX_PORT=80 -e SERVER_NAME=localhost
+          dumply-frontend:ci nginx -t
+
+      - name: Validate rendered HTTPS Nginx config
+        run: |
+          cert_dir="${RUNNER_TEMP}/dumply-ci-certs"
+          mkdir -p "$cert_dir"
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+            -subj /CN=localhost \
+            -keyout "$cert_dir/privkey.pem" \
+            -out "$cert_dir/fullchain.pem"
+          docker run --rm --add-host backend:127.0.0.1 \
+            -v "$cert_dir:/etc/nginx/certs:ro" \
+            -e ENABLE_TLS=true -e NGINX_PORT=8080 -e NGINX_HTTPS_PORT=8443 \
+            -e SERVER_NAME=localhost \
+            -e TLS_CERT_FILE=/etc/nginx/certs/fullchain.pem \
+            -e TLS_KEY_FILE=/etc/nginx/certs/privkey.pem \
+            dumply-frontend:ci nginx -t

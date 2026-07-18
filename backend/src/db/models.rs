@@ -9,6 +9,7 @@ pub struct User {
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub role: String,
+    pub token_version: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -43,6 +44,7 @@ pub struct BackupHistory {
     pub file_size: Option<i64>,
     #[serde(skip_serializing)]
     pub file_path: Option<String>,
+    pub is_downloadable: bool,
     pub error_message: Option<String>,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,

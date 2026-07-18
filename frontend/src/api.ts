@@ -31,6 +31,7 @@ export type BackupHistory = {
   status: string;
   file_name: string | null;
   file_size: number | null;
+  is_downloadable: boolean;
   error_message: string | null;
   started_at: string;
   completed_at: string | null;
@@ -64,6 +65,7 @@ export type DashboardStats = {
   success_count: number;
   failed_count: number;
   storage_bytes: number;
+  pending_file_deletions: number;
 };
 
 type ApiEnvelope<T> = { data: T };
@@ -195,24 +197,46 @@ export class ApiClient {
   }
 
   async downloadHistory(id: string) {
-    const response = await fetch(`${API_BASE}/backup-history/${id}/download`, {
-      headers: this.headers(false),
-    });
-    if (!response.ok) {
-      throw new Error(await responseError(response));
+    if (!this.token) {
+      throw new Error('unauthorized');
     }
 
-    const blob = await response.blob();
-    const disposition = response.headers.get('content-disposition') ?? '';
-    const fileName = disposition.match(/filename="([^"]+)"/)?.[1] ?? 'backup.sql';
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = fileName;
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+    const downloadUrl = `${API_BASE}/backup-history/${encodeURIComponent(id)}/download`;
+    // Validate the session and file immediately before the native submission. The actual POST
+    // still streams outside JavaScript, while common 401/404 failures remain visible to the UI.
+    const preflight = await fetch(downloadUrl, {
+      method: 'HEAD',
+      headers: this.headers(false),
+    });
+    if (!preflight.ok) {
+      throw new Error(await responseError(preflight));
+    }
+
+    // A native form download lets the browser stream the attachment directly to disk. Fetching
+    // a Blob here would duplicate the entire database backup in browser memory first.
+    const targetName = 'dumply-backup-download';
+    let target = document.querySelector<HTMLIFrameElement>(`iframe[name="${targetName}"]`);
+    if (!target) {
+      target = document.createElement('iframe');
+      target.name = targetName;
+      target.hidden = true;
+      target.setAttribute('aria-hidden', 'true');
+      document.body.append(target);
+    }
+
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = downloadUrl;
+    form.target = targetName;
+    form.hidden = true;
+    const token = document.createElement('input');
+    token.type = 'hidden';
+    token.name = 'token';
+    token.value = this.token;
+    form.append(token);
+    document.body.append(form);
+    form.submit();
+    form.remove();
   }
 
   private async request<T>(path: string, init: RequestInit = {}) {

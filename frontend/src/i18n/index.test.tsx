@@ -33,6 +33,7 @@ describe('LanguageProvider', () => {
     expect(screen.getByTestId('language')).toHaveTextContent('en');
     expect(screen.getByText('Login to Backup Console')).toBeInTheDocument();
     expect(screen.getByText('Page 3')).toBeInTheDocument();
+    expect(document.documentElement).toHaveAttribute('lang', 'en');
   });
 
   it('prefers persisted language and stores updates', async () => {
@@ -49,6 +50,7 @@ describe('LanguageProvider', () => {
     expect(screen.getByTestId('language')).toHaveTextContent('en');
     expect(screen.getByText('Login to Backup Console')).toBeInTheDocument();
     expect(localStorage.getItem('dumply_language')).toBe('en');
+    expect(document.documentElement).toHaveAttribute('lang', 'en');
   });
 
   it('falls back to the key when a translation is missing', () => {

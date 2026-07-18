@@ -413,6 +413,7 @@ dependencies = [
  "dotenvy",
  "jsonwebtoken",
  "lettre",
+ "libc",
  "percent-encoding",
  "serde",
  "serde_json",

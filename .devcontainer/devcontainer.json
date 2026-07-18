@@ -1,0 +1,47 @@
+{
+  "name": "DumplySquirrel (Rust + Node)",
+  "dockerComposeFile": [
+    "../docker-compose.dev.yml",
+    "docker-compose.devcontainer.yml"
+  ],
+  "service": "workspace",
+  "workspaceFolder": "/workspace",
+  // Only bring up Postgres and the workspace; run backend/frontend yourself.
+  "runServices": ["postgres", "workspace"],
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "forwardPorts": [8000, 5173, 5432],
+  "portsAttributes": {
+    "8000": { "label": "backend (axum)" },
+    "5173": { "label": "frontend (vite)" },
+    "5432": { "label": "postgres" }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-azuretools.vscode-docker",
+        "eamodio.gitlens",
+        "editorconfig.editorconfig",
+        "ckolkman.vscode-postgres"
+      ],
+      "settings": {
+        "rust-analyzer.linkedProjects": ["backend/Cargo.toml"],
+        "rust-analyzer.check.command": "clippy",
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  },
+  "remoteUser": "vscode"
+}

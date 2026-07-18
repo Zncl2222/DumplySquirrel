@@ -22,6 +22,7 @@
     "success": "成功",
     "failed": "失敗",
     "storage": "儲存用量",
+    "pendingCleanup": "等待清理的檔案",
     "recentBackups": "最近備份"
   },
   "configs": {
@@ -120,9 +121,10 @@
     },
     "delete": {
       "title": "確定要刪除備份設定？",
-      "description": "這會刪除「{name}」的設定，之後不會再依照這個排程自動備份。",
+      "description": "這會永久刪除「{name}」的設定與所有執行歷史；系統管理的備份檔案會排入背景清理，失敗時持續重試。此動作無法復原。",
       "cancel": "取消",
-      "confirm": "確認刪除"
+      "confirm": "永久刪除",
+      "deleting": "刪除中…"
     }
   },
   "history": {

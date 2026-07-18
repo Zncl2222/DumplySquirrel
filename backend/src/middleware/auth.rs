@@ -9,6 +9,8 @@ use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 use crate::{
@@ -18,8 +20,11 @@ use crate::{
 };
 
 const LOGIN_WINDOW: StdDuration = StdDuration::from_secs(60);
-const LOGIN_BLOCK: StdDuration = StdDuration::from_secs(300);
 const MAX_LOGIN_FAILURES: u32 = 5;
+const LOGIN_DELAY_STEP: StdDuration = StdDuration::from_millis(250);
+const LOGIN_DELAY_MAX: StdDuration = StdDuration::from_secs(2);
+const LOGIN_HASH_PERMITS: usize = 4;
+const LOGIN_HASH_QUEUE_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 const MAX_LOGIN_ATTEMPT_KEYS: usize = 10_000;
 const MAX_LOGIN_USERNAME_LEN: usize = 100;
 const REVOKED_TOKEN_PRUNE_INTERVAL_SECONDS: usize = 60;
@@ -29,6 +34,8 @@ pub struct Claims {
     pub sub: Uuid,
     pub username: String,
     pub role: String,
+    #[serde(default)]
+    pub token_version: i64,
     pub exp: usize,
 }
 
@@ -37,26 +44,37 @@ pub struct AuthUser {
     pub id: Uuid,
     pub username: String,
     pub role: String,
+    pub token_version: i64,
 }
 
 #[derive(Debug)]
 struct LoginAttempt {
     failures: u32,
     window_started: Instant,
-    blocked_until: Option<Instant>,
 }
 
 #[derive(Debug)]
 pub struct LoginThrottleKeys {
-    ip_key: String,
     account_key: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AuthState {
     login_attempts: tokio::sync::Mutex<HashMap<String, LoginAttempt>>,
+    login_hash_permits: Semaphore,
     revoked_tokens: Mutex<HashMap<String, usize>>,
     last_revoked_token_prune: Mutex<usize>,
+}
+
+impl Default for AuthState {
+    fn default() -> Self {
+        Self {
+            login_attempts: tokio::sync::Mutex::new(HashMap::new()),
+            login_hash_permits: Semaphore::new(LOGIN_HASH_PERMITS),
+            revoked_tokens: Mutex::new(HashMap::new()),
+            last_revoked_token_prune: Mutex::new(0),
+        }
+    }
 }
 
 impl AuthState {
@@ -66,35 +84,41 @@ impl AuthState {
 
     pub async fn check_login_allowed(
         &self,
-        peer_addr: SocketAddr,
+        _peer_addr: SocketAddr,
         username: &str,
     ) -> AppResult<LoginThrottleKeys> {
-        let ip_key = format!("ip:{}", peer_addr.ip());
-        self.check_throttle_key(&ip_key).await?;
-
         let username = normalize_login_username(username)?;
-        let account_key = format!("account:{}:{}", peer_addr.ip(), username);
+        let account_key = format!("account:{username}");
         self.check_throttle_key(&account_key).await?;
 
-        Ok(LoginThrottleKeys {
-            ip_key,
-            account_key,
-        })
+        Ok(LoginThrottleKeys { account_key })
     }
 
     pub async fn record_login_failure(&self, keys: &LoginThrottleKeys) {
-        self.record_throttle_failure(&keys.ip_key).await;
         self.record_throttle_failure(&keys.account_key).await;
     }
 
     pub async fn clear_login_failures(&self, keys: &LoginThrottleKeys) {
         let mut attempts = self.login_attempts.lock().await;
-        attempts.remove(&keys.ip_key);
         attempts.remove(&keys.account_key);
+    }
+
+    pub async fn acquire_login_hash_permit(&self) -> AppResult<SemaphorePermit<'_>> {
+        match tokio::time::timeout(LOGIN_HASH_QUEUE_TIMEOUT, self.login_hash_permits.acquire())
+            .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(err)) => Err(AppError::Internal(err.into())),
+            Err(_) => Err(AppError::TooManyRequests),
+        }
     }
 
     pub fn authorize(&self, headers: &HeaderMap, config: &AppConfig) -> AppResult<AuthUser> {
         let token = bearer_token(headers)?;
+        self.authorize_token(token, config)
+    }
+
+    fn authorize_token(&self, token: &str, config: &AppConfig) -> AppResult<AuthUser> {
         self.reject_revoked_token(token)?;
         let token_data = decode_token(token, config)?;
 
@@ -102,6 +126,46 @@ impl AuthState {
             id: token_data.claims.sub,
             username: token_data.claims.username,
             role: token_data.claims.role,
+            token_version: token_data.claims.token_version,
+        })
+    }
+
+    /// Validates the token and reloads the user so deleted accounts and role changes take effect
+    /// immediately instead of trusting stale JWT claims until token expiry.
+    pub async fn authorize_active(
+        &self,
+        headers: &HeaderMap,
+        config: &AppConfig,
+        pool: &PgPool,
+    ) -> AppResult<AuthUser> {
+        let token = bearer_token(headers)?;
+        self.authorize_token_active(token, config, pool).await
+    }
+
+    pub async fn authorize_token_active(
+        &self,
+        token: &str,
+        config: &AppConfig,
+        pool: &PgPool,
+    ) -> AppResult<AuthUser> {
+        let token_user = self.authorize_token(token, config)?;
+        let active_user = sqlx::query_as::<_, (Uuid, String, String, i64)>(
+            "SELECT id, username, role, token_version FROM users WHERE id = $1",
+        )
+        .bind(token_user.id)
+        .fetch_optional(pool)
+        .await?;
+        let Some((id, username, role, token_version)) = active_user else {
+            return Err(AppError::Unauthorized);
+        };
+        if token_user.token_version != token_version {
+            return Err(AppError::Unauthorized);
+        }
+        Ok(AuthUser {
+            id,
+            username,
+            role,
+            token_version,
         })
     }
 
@@ -122,13 +186,13 @@ impl AuthState {
         let mut attempts = self.login_attempts.lock().await;
         prune_login_attempts(&mut attempts, now);
 
-        if let Some(attempt) = attempts.get(key) {
-            if attempt
-                .blocked_until
-                .is_some_and(|blocked_until| blocked_until > now)
-            {
-                return Err(AppError::TooManyRequests);
-            }
+        let delay = attempts
+            .get(key)
+            .map(login_failure_delay)
+            .unwrap_or_default();
+        drop(attempts);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         Ok(())
     }
@@ -147,19 +211,14 @@ impl AuthState {
         let attempt = attempts.entry(key.to_string()).or_insert(LoginAttempt {
             failures: 0,
             window_started: now,
-            blocked_until: None,
         });
 
         if now.duration_since(attempt.window_started) > LOGIN_WINDOW {
             attempt.failures = 0;
             attempt.window_started = now;
-            attempt.blocked_until = None;
         }
 
         attempt.failures += 1;
-        if attempt.failures >= MAX_LOGIN_FAILURES {
-            attempt.blocked_until = Some(now + LOGIN_BLOCK);
-        }
     }
 
     fn reject_revoked_token(&self, token: &str) -> AppResult<()> {
@@ -202,6 +261,7 @@ pub fn create_token(user: &User, config: &AppConfig) -> AppResult<(String, usize
         sub: user.id,
         username: user.username.clone(),
         role: user.role.clone(),
+        token_version: user.token_version,
         exp,
     };
 
@@ -237,16 +297,18 @@ fn normalize_login_username(username: &str) -> AppResult<String> {
     if username.is_empty() || username.len() > MAX_LOGIN_USERNAME_LEN {
         return Err(AppError::Unauthorized);
     }
-    Ok(username.to_lowercase())
+    Ok(username.to_string())
 }
 
 fn prune_login_attempts(attempts: &mut HashMap<String, LoginAttempt>, now: Instant) {
-    attempts.retain(|_, attempt| {
-        attempt
-            .blocked_until
-            .map(|blocked_until| blocked_until > now)
-            .unwrap_or_else(|| now.duration_since(attempt.window_started) <= LOGIN_WINDOW)
-    });
+    attempts.retain(|_, attempt| now.duration_since(attempt.window_started) <= LOGIN_WINDOW);
+}
+
+fn login_failure_delay(attempt: &LoginAttempt) -> StdDuration {
+    let steps = attempt
+        .failures
+        .saturating_sub(MAX_LOGIN_FAILURES.saturating_sub(1));
+    LOGIN_DELAY_STEP.saturating_mul(steps).min(LOGIN_DELAY_MAX)
 }
 
 pub fn require_admin(user: &AuthUser) -> AppResult<()> {

@@ -62,7 +62,10 @@ async fn list_running(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     let rows = sqlx::query_as::<_, RunningBackupRow>(
         r#"
         SELECT
@@ -87,6 +90,7 @@ async fn list_running(
             file_name: row.file_name,
             file_size: row.file_size,
             file_path: row.file_path,
+            is_downloadable: false,
             error_message: row.error_message,
             started_at: row.started_at,
             completed_at: row.completed_at,
@@ -115,7 +119,10 @@ async fn list_events(
     Path(history_id): Path<Uuid>,
     Query(query): Query<EventQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.auth.authorize(&headers, &state.config)?;
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
     let events = events_for_history(&state, history_id, query.after_sequence).await?;
     Ok(Json(json!({ "data": events })))
 }
