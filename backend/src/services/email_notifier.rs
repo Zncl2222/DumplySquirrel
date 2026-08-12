@@ -73,7 +73,7 @@ pub async fn notify_backup_completed(
 
 fn should_notify(rule: &str, status: &str) -> bool {
     match rule {
-        "always" => matches!(status, "success" | "failed" | "timeout"),
+        "always" => matches!(status, "success" | "failed" | "timeout" | "cancelled"),
         "failure" => matches!(status, "failed" | "timeout"),
         _ => false,
     }
@@ -183,5 +183,17 @@ async fn notification_event(pool: &PgPool, history_id: Uuid, level: &str, messag
     .await
     {
         tracing::warn!(history_id = %history_id, error = ?err, "failed to write email notification event");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_notify;
+
+    #[test]
+    fn cancellation_only_notifies_always_subscribers() {
+        assert!(should_notify("always", "cancelled"));
+        assert!(!should_notify("failure", "cancelled"));
+        assert!(!should_notify("never", "cancelled"));
     }
 }

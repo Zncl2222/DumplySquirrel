@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -67,6 +69,17 @@ struct BackupConfigResponse {
     created_by: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    last_run_status: Option<String>,
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_success_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct BackupConfigRunState {
+    config_id: Uuid,
+    last_run_status: Option<String>,
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_success_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub(super) async fn list_configs(
@@ -90,9 +103,13 @@ pub(super) async fn list_configs(
     .fetch_all(&state.db)
     .await?;
 
+    let run_states = load_config_run_states(&state.db).await?;
     let data = configs
         .into_iter()
-        .map(|config| config_response(config, &state.config.database_encryption_key))
+        .map(|config| {
+            let run_state = run_states.get(&config.id);
+            config_response(config, &state.config.database_encryption_key, run_state)
+        })
         .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(json!({ "data": data })))
 }
@@ -158,7 +175,7 @@ pub(super) async fn create_config(
     state.scheduler.refresh_config(config.id).await?;
 
     Ok(Json(json!({
-        "data": config_response(config, &state.config.database_encryption_key)?
+        "data": config_response(config, &state.config.database_encryption_key, None)?
     })))
 }
 
@@ -257,7 +274,7 @@ async fn update_config(
     state.scheduler.refresh_config(config.id).await?;
 
     Ok(Json(json!({
-        "data": config_response(config, &state.config.database_encryption_key)?
+        "data": config_response(config, &state.config.database_encryption_key, None)?
     })))
 }
 
@@ -356,7 +373,7 @@ async fn toggle_config(
     .await?;
     state.scheduler.refresh_config(config.id).await?;
     Ok(Json(json!({
-        "data": config_response(config, &state.config.database_encryption_key)?
+        "data": config_response(config, &state.config.database_encryption_key, None)?
     })))
 }
 
@@ -461,7 +478,43 @@ fn is_valid_email(value: &str) -> bool {
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
-fn config_response(config: BackupConfig, encryption_key: &str) -> AppResult<BackupConfigResponse> {
+async fn load_config_run_states(
+    pool: &sqlx::PgPool,
+) -> AppResult<HashMap<Uuid, BackupConfigRunState>> {
+    let states = sqlx::query_as::<_, BackupConfigRunState>(
+        r#"
+        SELECT c.id AS config_id,
+               latest.status AS last_run_status,
+               latest.started_at AS last_run_at,
+               (
+                   SELECT MAX(success.completed_at)
+                   FROM backup_history success
+                   WHERE success.config_id = c.id AND success.status = 'success'
+               ) AS last_success_at
+        FROM backup_configs c
+        LEFT JOIN LATERAL (
+            SELECT history.status, history.started_at
+            FROM backup_history history
+            WHERE history.config_id = c.id
+            ORDER BY history.started_at DESC
+            LIMIT 1
+        ) latest ON TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(states
+        .into_iter()
+        .map(|state| (state.config_id, state))
+        .collect())
+}
+
+fn config_response(
+    config: BackupConfig,
+    encryption_key: &str,
+    run_state: Option<&BackupConfigRunState>,
+) -> AppResult<BackupConfigResponse> {
     let db_url = crypto::decrypt_string(
         &config.db_url_encrypted,
         &config.db_url_nonce,
@@ -484,6 +537,9 @@ fn config_response(config: BackupConfig, encryption_key: &str) -> AppResult<Back
         created_by: config.created_by,
         created_at: config.created_at,
         updated_at: config.updated_at,
+        last_run_status: run_state.and_then(|state| state.last_run_status.clone()),
+        last_run_at: run_state.and_then(|state| state.last_run_at),
+        last_success_at: run_state.and_then(|state| state.last_success_at),
     })
 }
 

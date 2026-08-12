@@ -3,7 +3,7 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     db::models::BackupHistory,
     error::{AppError, AppResult},
+    services::backup_executor,
     AppState,
 };
 
@@ -21,10 +22,32 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_history))
         .route("/:id", get(get_history))
+        .route("/:id/cancel", post(cancel_history))
         .route(
             "/:id/download",
             get(download_history).post(download_history_form),
         )
+}
+
+async fn cancel_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    state
+        .auth
+        .authorize_active(&headers, &state.config, &state.db)
+        .await?;
+    backup_executor::request_backup_cancellation(&state.backup_runtime, id).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "data": {
+                "history_id": id,
+                "cancellation_requested": true
+            }
+        })),
+    ))
 }
 
 #[derive(Debug, Deserialize)]

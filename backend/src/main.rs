@@ -5,7 +5,7 @@ mod middleware;
 mod routes;
 mod services;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     http::{header, HeaderValue, Method, StatusCode},
@@ -18,7 +18,7 @@ use services::{
     scheduler::BackupScheduler,
 };
 use sqlx::PgPool;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tower_http::{
     cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer,
 };
@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         db: db.clone(),
         config: config.clone(),
         permits: Arc::new(Semaphore::new(config.max_concurrent_backups)),
+        cancellations: Arc::new(Mutex::new(HashMap::new())),
     };
     backup_executor::recover_interrupted_backups(&backup_runtime).await?;
     let file_deletion_worker = services::file_deletion::spawn_file_deletion_worker(

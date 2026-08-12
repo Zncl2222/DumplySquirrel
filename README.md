@@ -39,6 +39,13 @@ may wait up to 30 seconds for the old lease to expire.
 
 The dashboard is served by Nginx on `http://localhost` by default. The backend is available inside Docker Compose as `backend:3000` and is exposed through `/api`.
 
+The backend exposes unauthenticated probes for container orchestrators and external monitors:
+
+- `GET /api/health/live` confirms that the process is serving requests.
+- `GET /api/health/ready` verifies both the configuration database and a real create/write/delete
+  cycle in the backup directory. It returns HTTP `503` when either dependency is unavailable.
+- `GET /api/health` is a backwards-compatible alias for the readiness probe.
+
 Completed backup files are written inside the backend container at `/backups`. Set `BACKUP_STORAGE_PATH` in `.env` to choose where that directory is mounted on the host:
 
 ```bash
@@ -46,6 +53,10 @@ BACKUP_STORAGE_PATH=/mnt/storage/dumply/backups
 ```
 
 Relative paths such as `./backups` are resolved from the directory containing `docker-compose.yml`.
+
+For production monitoring, cancellation behavior, restore drills, incident response, and the
+deployment checklist, see [docs/OPERATIONS.md](docs/OPERATIONS.md). A backup is not considered
+proven until it has been restored and checked in an isolated environment.
 
 Email notifications use the SMTP sender configured in `.env`. You can edit `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, and `SMTP_TLS` manually, or run:
 
@@ -189,6 +200,8 @@ The host dev scripts stop the matching Docker dev app container first, so ports 
 - User list/create/delete for admin users.
 - Backup config list/create/update/delete/toggle with encrypted `db_url` storage and masked API output.
 - Manual trigger endpoint that starts a guarded background backup worker.
+- Asynchronous backup cancellation that terminates the dump process tree, removes partial output,
+  records a `cancelled` terminal state, and exposes progress in the Run Room.
 - PostgreSQL backup via version-matched `pg_dump` using `PGPASSWORD` instead of password arguments.
 - MySQL backup via system `mysqldump` using a temporary option file instead of password arguments.
 - Backup timeout handling, private atomic output files, restart recovery, and startup/hourly
@@ -199,8 +212,11 @@ The host dev scripts stop the matching Docker dev app container first, so ports 
   `BACKUP_DIR` path checks.
 - Config deletion serializes against triggers, commits a durable file-deletion intent atomically,
   and retries managed-file cleanup without risking a database rollback that points at a lost file.
-- Dashboard stats endpoint.
-- React dashboard for login, stats, backup config CRUD, manual trigger, history download, and user management.
+- Readiness and liveness endpoints, with Docker health gating before Nginx starts.
+- Dashboard stats for backup coverage, active runs, last success, outcomes, storage, and cleanup
+  backlog; config rows also expose their latest run and last successful run.
+- React dashboard for login, operational stats, backup config CRUD, manual trigger/cancel, Run Room
+  events, history download, and user management.
 - Nginx reverse proxy serving the frontend and proxying `/api` to the backend.
 - Optional TLS mode controlled by `ENABLE_TLS`.
 - Backend graceful shutdown and configurable CORS origin.
@@ -208,4 +224,4 @@ The host dev scripts stop the matching Docker dev app container first, so ports 
 ## Pending
 
 - Automated integration tests against live PostgreSQL/MySQL targets.
-- Backup cancellation endpoint.
+- Automated restore verification and off-host storage replication.

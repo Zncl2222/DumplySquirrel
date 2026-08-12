@@ -350,10 +350,127 @@ async fn command_timeout_terminates_descendants_without_waiting_on_their_pipes()
     let started = std::time::Instant::now();
 
     assert!(matches!(
-        run_command_output("sh", command, 1).await,
+        run_command_output("sh", command, 1, None).await,
         Err(AppError::BackupTimeout)
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_cancellation_terminates_descendants_promptly() {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg("sleep 30 & wait");
+    let cancellation = CancellationToken::new();
+    let cancellation_request = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancellation_request.cancel();
+    });
+    let started = std::time::Instant::now();
+
+    assert!(matches!(
+        run_command("sh", command, 30, &cancellation).await,
+        Err(AppError::BackupCancelled)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
+async fn cancellation_request_signals_the_worker_and_records_an_audit_event() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to a disposable PostgreSQL database");
+    let pool = crate::db::connect(&database_url).await.unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+    let config_id = Uuid::new_v4();
+    let history_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO backup_configs
+            (id, name, db_type, db_url_encrypted, db_url_nonce, is_enabled)
+        VALUES ($1, $2, 'postgres', 'unused', 'unused', false)
+        "#,
+    )
+    .bind(config_id)
+    .bind(format!("cancellation-request-{config_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO backup_history (id, config_id, status, started_at, triggered_by)
+        VALUES ($1, $2, 'running', now(), 'manual')
+        "#,
+    )
+    .bind(history_id)
+    .bind(config_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let cancellation = CancellationToken::new();
+    let cancellations = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+        (history_id, cancellation.clone()),
+    ])));
+    let backup_directory = tempfile::tempdir().unwrap();
+    let runtime = BackupRuntime {
+        db: pool.clone(),
+        config: Arc::new(AppConfig {
+            database_url,
+            jwt_secret: "test-jwt-secret".into(),
+            database_encryption_key: "test-encryption-key".into(),
+            previous_database_encryption_key: None,
+            backup_dir: backup_directory.path().to_path_buf(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            admin_username: "admin".into(),
+            admin_password: "test-password".into(),
+            reset_admin_password_on_start: false,
+            jwt_ttl_seconds: 60,
+            max_concurrent_backups: 1,
+            cors_allowed_origin: None,
+            smtp: None,
+        }),
+        permits: Arc::new(Semaphore::new(1)),
+        cancellations,
+    };
+
+    request_backup_cancellation(&runtime, history_id)
+        .await
+        .unwrap();
+    assert!(cancellation.is_cancelled());
+    let event: (String, String, String) = sqlx::query_as(
+        r#"
+        SELECT stage, level, message
+        FROM backup_events
+        WHERE history_id = $1
+        ORDER BY sequence DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(history_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event.0, "cancel");
+    assert_eq!(event.1, "warning");
+    assert!(event.2.contains("Cancellation requested"));
+
+    sqlx::query("UPDATE backup_history SET status = 'cancelled' WHERE id = $1")
+        .bind(history_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        request_backup_cancellation(&runtime, history_id).await,
+        Err(AppError::Conflict(_))
+    ));
+
+    sqlx::query("DELETE FROM backup_configs WHERE id = $1")
+        .bind(config_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -416,6 +533,7 @@ async fn periodic_retention_sweeps_disabled_configs_without_a_new_success() {
             smtp: None,
         }),
         permits: Arc::new(Semaphore::new(1)),
+        cancellations: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     // A concurrent policy relaxation must win before retention reads its rules. Holding the

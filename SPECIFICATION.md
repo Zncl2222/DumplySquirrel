@@ -1,6 +1,6 @@
 # DumplySquirrel — 備份管理系統規格書
 
-> 最後更新：2026-06-12
+> 最後更新：2026-08-13
 
 ---
 
@@ -98,11 +98,10 @@ Dockerized 備份管理系統，提供 Web Dashboard 讓管理者設定、排程
 
 | 工具 | 用途 |
 |------|------|
-| Vite | 建置工具 |
-| React Router v7 | 前端路由 |
-| shadcn/ui + Tailwind CSS | UI 元件庫（或 MUI 簡潔版） |
-| React Query (TanStack Query) | API 狀態管理與快取 |
-| axios | HTTP client |
+| React 18 | Dashboard UI 與元件狀態 |
+| Vite + TypeScript | 開發、型別檢查與正式建置 |
+| Fetch API | 帶 Bearer token 的 API client 與錯誤封裝 |
+| Vitest + Testing Library | 元件、i18n 與 API client 測試 |
 
 **備份執行容器內需預裝**：`postgresql-client`、`mysql-client`（於 Dockerfile 中 apt install）。
 
@@ -146,7 +145,7 @@ Dockerized 備份管理系統，提供 Web Dashboard 讓管理者設定、排程
 |------|------|------|------|
 | `id` | UUID | PK | |
 | `config_id` | UUID | FK → backup_configs(id) ON DELETE CASCADE | |
-| `status` | VARCHAR(20) | NOT NULL | `running` / `success` / `failed` |
+| `status` | VARCHAR(20) | NOT NULL | `running` / `success` / `failed` / `timeout` / `cancelled` |
 | `file_name` | VARCHAR(255) | NULLABLE | 備份檔名 |
 | `file_size` | BIGINT | NULLABLE | 檔案大小（bytes） |
 | `file_path` | TEXT | NULLABLE | 容器內路徑 |
@@ -194,15 +193,24 @@ Dockerized 備份管理系統，提供 Web Dashboard 讓管理者設定、排程
 |--------|------|------|------|
 | `GET` | `/api/backup-history` | `?config_id=&status=&page=&per_page=` | 列表（可過濾、分頁） |
 | `GET` | `/api/backup-history/:id` | — | 單筆記錄明細 |
+| `POST` | `/api/backup-history/:id/cancel` | — | 非同步要求取消執行中的備份；回傳 HTTP `202`，最終狀態由歷史記錄確認 |
 | `GET` | `/api/backup-history/:id/download` | — | 下載備份檔案（stream） |
 
 ### 5.5 Dashboard Stats（需 JWT）
 
 | Method | Path | 說明 |
 |--------|------|------|
-| `GET` | `/api/dashboard/stats` | 總任務數、總備份次數、成功/失敗數、本日備份數、儲存總用量 |
+| `GET` | `/api/dashboard/stats` | 任務數、有可下載成功備份的任務數、執行中數、成功/失敗/取消數、最後成功時間、儲存總用量、待清理檔案數 |
 
-### 5.6 Response 格式
+### 5.6 Health（不需 JWT）
+
+| Method | Path | 說明 |
+|--------|------|------|
+| `GET` | `/api/health/live` | 行程存活檢查，不探測外部依賴 |
+| `GET` | `/api/health/ready` | 實際探測設定資料庫與備份目錄寫入/刪除能力；未就緒時回傳 HTTP `503` |
+| `GET` | `/api/health` | 相容舊版的 readiness alias |
+
+### 5.7 Response 格式
 
 ```json
 // 成功
@@ -348,7 +356,9 @@ services:
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
-    depends_on: [backend]
+    depends_on:
+      backend:
+        condition: service_healthy
     environment:
       NGINX_PORT: ${HTTP_PORT:-80}
       NGINX_HTTPS_PORT: ${HTTPS_PORT:-443}
@@ -627,6 +637,8 @@ DumplySquirrel/
 - 備份檔名由 `config_id + UTC timestamp` 組成，不使用使用者輸入的任務名稱。
 - 同一個 config 同時間只允許一個 running backup；全域需限制最大併發數，避免壓垮目標資料庫。
 - 每次備份有 timeout；逾時需 kill child process、標記 `timeout`，並清理不完整檔案。
+- 執行中備份可非同步取消；需終止整個 dump process group、清理 partial file、寫入事件，
+  並將 history 標記為 `cancelled`。已完成封存/提交的競態可維持 `success`。
 - retention 清理同時依 `retention_days` 與 `max_backups` 執行；啟動時及每小時重跑。
   清理必須鎖定並重讀最新設定，再把檔案原子寫入 durable deletion outbox；刪除失敗需保留重試狀態與錯誤日誌。
 
@@ -646,7 +658,8 @@ DumplySquirrel/
 
 ### 11.5 部署可行性
 
-- Compose 需為 PostgreSQL 定義 healthcheck，backend 依健康狀態啟動。
+- Compose 需為 PostgreSQL 與 backend 定義 healthcheck；backend 依 PostgreSQL 健康狀態啟動，
+  frontend 依 backend readiness 啟動。Readiness 必須同時驗證設定 DB 與備份目錄可寫入。
 - backend runtime image 使用 Debian 可用的 `postgresql-client` 與 `default-mysql-client` 套件名。
 - Nginx `proxy_pass http://backend:3000;` 保留 `/api/*` path，與後端路由一致。
 - TLS 條件式配置需用自訂 entrypoint 或兩份 template 實作，不能只依賴 nginx envsubst 自動插入邏輯區塊。

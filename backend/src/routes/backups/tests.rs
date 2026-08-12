@@ -184,6 +184,9 @@ fn test_backup_runtime(pool: sqlx::PgPool, database_url: String) -> backup_execu
         db: pool,
         config: std::sync::Arc::new(config),
         permits: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        cancellations: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     }
 }
 

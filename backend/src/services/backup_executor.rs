@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io,
     path::{Component, Path, PathBuf},
@@ -11,7 +12,12 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use sqlx::PgPool;
 use tempfile::NamedTempFile;
-use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::{Mutex, Semaphore},
+};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -25,6 +31,7 @@ use crate::{
 enum BackupFinalStatus {
     Success,
     Timeout,
+    Cancelled,
 }
 
 impl BackupFinalStatus {
@@ -32,6 +39,7 @@ impl BackupFinalStatus {
         match self {
             Self::Success => "success",
             Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -41,6 +49,7 @@ pub struct BackupRuntime {
     pub db: PgPool,
     pub config: Arc<AppConfig>,
     pub permits: Arc<Semaphore>,
+    pub cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,14 +74,64 @@ pub async fn spawn_backup(
 ) -> AppResult<BackupHistory> {
     let (config, history) = prepare_backup(&runtime.db, config_id, trigger).await?;
     let history_id = history.id;
+    let cancellation = CancellationToken::new();
+    runtime
+        .cancellations
+        .lock()
+        .await
+        .insert(history_id, cancellation.clone());
 
     tokio::spawn(async move {
-        if let Err(err) = run_backup(runtime, config, history_id).await {
+        if let Err(err) = run_backup(runtime.clone(), config, history_id, cancellation).await {
             tracing::error!(history_id = %history_id, error = ?err, "backup worker failed");
         }
+        runtime.cancellations.lock().await.remove(&history_id);
     });
 
     Ok(history)
+}
+
+pub async fn request_backup_cancellation(
+    runtime: &BackupRuntime,
+    history_id: Uuid,
+) -> AppResult<()> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM backup_history WHERE id = $1")
+            .bind(history_id)
+            .fetch_optional(&runtime.db)
+            .await?;
+    let Some(status) = status else {
+        return Err(AppError::NotFound);
+    };
+    if status != "running" {
+        return Err(AppError::Conflict(format!(
+            "backup is already {status} and cannot be cancelled"
+        )));
+    }
+
+    let cancellation = runtime
+        .cancellations
+        .lock()
+        .await
+        .get(&history_id)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "backup worker is no longer active; refresh its status and try again".into(),
+            )
+        })?;
+    // Stop the process immediately; recording the audit event must not delay cancellation if the
+    // configuration database is briefly slow.
+    cancellation.cancel();
+    backup_event(
+        &runtime.db,
+        history_id,
+        "cancel",
+        "warning",
+        "Cancellation requested by an administrator.",
+    )
+    .await;
+    Ok(())
 }
 
 async fn prepare_backup(
@@ -130,6 +189,7 @@ async fn run_backup(
     runtime: BackupRuntime,
     config: BackupConfig,
     history_id: Uuid,
+    cancellation: CancellationToken,
 ) -> AppResult<()> {
     backup_event(
         &runtime.db,
@@ -139,11 +199,29 @@ async fn run_backup(
         "Backup worker queued for an execution slot.",
     )
     .await;
-    let permit_result = tokio::time::timeout(
-        Duration::from_secs(30),
-        runtime.permits.clone().acquire_owned(),
-    )
-    .await;
+    let permit_result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            mark_cancelled(
+                &runtime,
+                history_id,
+                "Backup cancelled while waiting for an execution slot.",
+            )
+            .await?;
+            email_notifier::notify_backup_completed(
+                &runtime.db,
+                &runtime.config,
+                &config,
+                history_id,
+                "cancelled",
+            )
+            .await;
+            return Ok(());
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(30),
+            runtime.permits.clone().acquire_owned(),
+        ) => result,
+    };
     let permit = match permit_result {
         Ok(Ok(permit)) => permit,
         Ok(Err(err)) => {
@@ -184,7 +262,7 @@ async fn run_backup(
     )
     .await;
 
-    let result = execute_backup(&runtime, &config, history_id).await;
+    let result = execute_backup(&runtime, &config, history_id, &cancellation).await;
     drop(permit);
 
     match result {
@@ -222,6 +300,12 @@ async fn run_backup(
         }
     }
 
+    Ok(())
+}
+
+async fn mark_cancelled(runtime: &BackupRuntime, history_id: Uuid, message: &str) -> AppResult<()> {
+    backup_event(&runtime.db, history_id, "cancelled", "warning", message).await;
+    mark_failed_if_running(&runtime.db, history_id, "cancelled", message).await?;
     Ok(())
 }
 
@@ -333,7 +417,17 @@ async fn execute_backup(
     runtime: &BackupRuntime,
     config: &BackupConfig,
     history_id: Uuid,
+    cancellation: &CancellationToken,
 ) -> AppResult<BackupFinalStatus> {
+    if cancellation.is_cancelled() {
+        mark_cancelled(
+            runtime,
+            history_id,
+            "Backup cancelled before execution started.",
+        )
+        .await?;
+        return Ok(BackupFinalStatus::Cancelled);
+    }
     tokio::fs::create_dir_all(&runtime.config.backup_dir)
         .await
         .map_err(|err| AppError::Internal(err.into()))?;
@@ -397,6 +491,7 @@ async fn execute_backup(
                 output_file,
                 config.db_version.as_deref(),
                 config.timeout_seconds,
+                cancellation,
             )
             .await
         }
@@ -408,10 +503,16 @@ async fn execute_backup(
                 output_file,
                 config.db_version.as_deref(),
                 config.timeout_seconds,
+                cancellation,
             )
             .await
         }
         other => Err(AppError::Validation(format!("unsupported db_type {other}"))),
+    };
+
+    let dump_result = match dump_result {
+        Ok(()) if cancellation.is_cancelled() => Err(AppError::BackupCancelled),
+        result => result,
     };
 
     match dump_result {
@@ -519,6 +620,13 @@ async fn execute_backup(
             )
             .await?;
             Ok(BackupFinalStatus::Timeout)
+        }
+        Err(AppError::BackupCancelled) => {
+            cleanup_partial_file(&partial_path).await;
+            let message = "Backup cancelled by an administrator. Partial file was removed.";
+            backup_event(&runtime.db, history_id, "cancelled", "warning", message).await;
+            mark_failed(&runtime.db, history_id, "cancelled", message, None).await?;
+            Ok(BackupFinalStatus::Cancelled)
         }
         Err(err) => {
             cleanup_partial_file(&partial_path).await;
@@ -649,6 +757,7 @@ async fn run_pg_dump(
     output: File,
     configured_version: Option<&str>,
     timeout_seconds: i32,
+    cancellation: &CancellationToken,
 ) -> AppResult<()> {
     let configured_version = configured_version
         .map(str::trim)
@@ -674,7 +783,8 @@ async fn run_pg_dump(
                 "Detecting PostgreSQL server version.",
             )
             .await;
-            let version = detect_postgres_major_version(target, timeout_seconds).await?;
+            let version =
+                detect_postgres_major_version(target, timeout_seconds, Some(cancellation)).await?;
             backup_event(
                 pool,
                 history_id,
@@ -686,7 +796,7 @@ async fn run_pg_dump(
             version
         }
     };
-    let command_path = resolve_pg_dump_command(&major_version).await?;
+    let command_path = resolve_pg_dump_command(&major_version, Some(cancellation)).await?;
     tracing::info!(postgres_version = %major_version, pg_dump = %command_path, "using PostgreSQL pg_dump client");
     backup_event(
         pool,
@@ -713,7 +823,7 @@ async fn run_pg_dump(
     }
 
     backup_event(pool, history_id, "dump", "info", "pg_dump process started.").await;
-    run_command(&command_path, command, timeout_seconds).await?;
+    run_command(&command_path, command, timeout_seconds, cancellation).await?;
     backup_event(
         pool,
         history_id,
@@ -732,6 +842,7 @@ async fn run_mysqldump(
     output: File,
     configured_version: Option<&str>,
     timeout_seconds: i32,
+    cancellation: &CancellationToken,
 ) -> AppResult<()> {
     let configured_version = configured_version
         .map(str::trim)
@@ -757,7 +868,7 @@ async fn run_mysqldump(
                 "Detecting MySQL server version.",
             )
             .await;
-            let version = detect_mysql_version(target, timeout_seconds).await?;
+            let version = detect_mysql_version(target, timeout_seconds, Some(cancellation)).await?;
             backup_event(
                 pool,
                 history_id,
@@ -796,7 +907,7 @@ async fn run_mysqldump(
         "mysqldump process started.",
     )
     .await;
-    let result = run_command("mysqldump", command, timeout_seconds).await;
+    let result = run_command("mysqldump", command, timeout_seconds, cancellation).await;
     drop(option_file);
     if result.is_ok() {
         backup_event(
@@ -814,6 +925,7 @@ async fn run_mysqldump(
 async fn detect_postgres_major_version(
     target: &DumpTarget,
     timeout_seconds: i32,
+    cancellation: Option<&CancellationToken>,
 ) -> AppResult<String> {
     let mut command = Command::new("psql");
     command
@@ -834,11 +946,14 @@ async fn detect_postgres_major_version(
         command.env("PGPASSWORD", password);
     }
 
-    let output = run_command_output("psql", command, timeout_seconds).await?;
+    let output = run_command_output("psql", command, timeout_seconds, cancellation).await?;
     postgres_major_from_server_version_num(output.trim())
 }
 
-async fn resolve_pg_dump_command(major_version: &str) -> AppResult<String> {
+async fn resolve_pg_dump_command(
+    major_version: &str,
+    cancellation: Option<&CancellationToken>,
+) -> AppResult<String> {
     let managed_path = format!("/usr/lib/postgresql/{major_version}/bin/pg_dump");
     let mut candidates = Vec::new();
     if Path::new(&managed_path).exists() {
@@ -847,7 +962,7 @@ async fn resolve_pg_dump_command(major_version: &str) -> AppResult<String> {
     candidates.push("pg_dump".to_string());
 
     for candidate in candidates {
-        match command_postgres_major(&candidate).await {
+        match command_postgres_major(&candidate, cancellation).await {
             Ok(candidate_major) if candidate_major == major_version => return Ok(candidate),
             _ => {}
         }
@@ -858,14 +973,21 @@ async fn resolve_pg_dump_command(major_version: &str) -> AppResult<String> {
     )))
 }
 
-async fn command_postgres_major(command_path: &str) -> AppResult<String> {
+async fn command_postgres_major(
+    command_path: &str,
+    cancellation: Option<&CancellationToken>,
+) -> AppResult<String> {
     let mut command = Command::new(command_path);
     command.arg("--version");
-    let output = run_command_output(command_path, command, 10).await?;
+    let output = run_command_output(command_path, command, 10, cancellation).await?;
     postgres_major_from_pg_dump_version(&output)
 }
 
-async fn detect_mysql_version(target: &DumpTarget, timeout_seconds: i32) -> AppResult<String> {
+async fn detect_mysql_version(
+    target: &DumpTarget,
+    timeout_seconds: i32,
+    cancellation: Option<&CancellationToken>,
+) -> AppResult<String> {
     let option_file = mysql_option_file(target)?;
     let option_path = option_file.path().to_path_buf();
     let mut command = Command::new("mysql");
@@ -879,7 +1001,7 @@ async fn detect_mysql_version(target: &DumpTarget, timeout_seconds: i32) -> AppR
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
 
-    let result = run_command_output("mysql", command, timeout_seconds).await;
+    let result = run_command_output("mysql", command, timeout_seconds, cancellation).await;
     drop(option_file);
     result.map(|output| output.trim().to_string())
 }
@@ -888,6 +1010,7 @@ async fn run_command_output(
     command_name: &str,
     mut command: Command,
     timeout_seconds: i32,
+    cancellation: Option<&CancellationToken>,
 ) -> AppResult<String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_child_process(&mut command);
@@ -896,12 +1019,21 @@ async fn run_command_output(
         .map_err(|err| command_spawn_error(command_name, err))?;
     let mut stdout_task = tokio::spawn(read_stream(child.stdout.take()));
     let mut stderr_task = tokio::spawn(read_stream(child.stderr.take()));
-    let status = match tokio::time::timeout(
-        Duration::from_secs(timeout_seconds.max(1) as u64),
-        child.wait(),
-    )
-    .await
-    {
+    let wait_result = tokio::select! {
+        _ = wait_for_cancellation(cancellation) => {
+            terminate_child_process(&mut child).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(AppError::BackupCancelled);
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(timeout_seconds.max(1) as u64),
+            child.wait(),
+        ) => result,
+    };
+    let status = match wait_result {
         Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
         Err(_) => {
             terminate_child_process(&mut child).await;
@@ -968,6 +1100,7 @@ async fn run_command(
     command_name: &str,
     mut command: Command,
     timeout_seconds: i32,
+    cancellation: &CancellationToken,
 ) -> AppResult<()> {
     configure_child_process(&mut command);
     let mut child = command
@@ -976,17 +1109,27 @@ async fn run_command(
     let stderr = child.stderr.take();
     let mut stderr_task = tokio::spawn(read_stderr(stderr));
 
-    let status =
-        match tokio::time::timeout(Duration::from_secs(timeout_seconds as u64), child.wait()).await
-        {
-            Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
-            Err(_) => {
-                terminate_child_process(&mut child).await;
-                stderr_task.abort();
-                let _ = stderr_task.await;
-                return Err(AppError::BackupTimeout);
-            }
-        };
+    let wait_result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            terminate_child_process(&mut child).await;
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            return Err(AppError::BackupCancelled);
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(timeout_seconds.max(1) as u64),
+            child.wait(),
+        ) => result,
+    };
+    let status = match wait_result {
+        Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
+        Err(_) => {
+            terminate_child_process(&mut child).await;
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            return Err(AppError::BackupTimeout);
+        }
+    };
 
     let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
         Ok(result) => result.unwrap_or_default(),
@@ -1010,6 +1153,13 @@ async fn run_command(
     }
 
     Ok(())
+}
+
+async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 fn configure_child_process(command: &mut Command) {
@@ -1596,9 +1746,9 @@ pub async fn detect_db_version(
     let target = DumpTarget::parse(db_url)?;
     target.validate_db_type(db_type)?;
     match db_type {
-        "postgres" => detect_postgres_major_version(&target, timeout_seconds).await,
+        "postgres" => detect_postgres_major_version(&target, timeout_seconds, None).await,
         "mysql" => {
-            let version = detect_mysql_version(&target, timeout_seconds).await?;
+            let version = detect_mysql_version(&target, timeout_seconds, None).await?;
             let parts: Vec<&str> = version.split('.').collect();
             if parts.len() >= 2 {
                 Ok(format!("{}.{}", parts[0], parts[1]))

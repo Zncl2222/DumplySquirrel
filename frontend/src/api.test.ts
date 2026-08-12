@@ -43,6 +43,22 @@ describe('ApiClient', () => {
     await expect(new ApiClient('bad-token').me()).rejects.toThrow('unauthorized');
   });
 
+  it('requests cancellation against the backup history resource', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      data: { history_id: 'run-1', cancellation_requested: true },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(new ApiClient('token-1').cancelBackup('run-1')).resolves.toEqual({
+      history_id: 'run-1',
+      cancellation_requested: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/backup-history/run-1/cancel', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token-1' },
+    });
+  });
+
   it('submits downloads natively instead of buffering the backup as a Blob', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);

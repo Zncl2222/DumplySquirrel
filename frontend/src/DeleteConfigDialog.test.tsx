@@ -21,6 +21,9 @@ const config: BackupConfig = {
   email_notify_on: 'never',
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
+  last_run_status: null,
+  last_run_at: null,
+  last_success_at: null,
 };
 
 function renderDialog(onConfirm: () => Promise<void>, onCancel = vi.fn()) {

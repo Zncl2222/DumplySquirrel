@@ -87,6 +87,8 @@ jobs:
           cargo test --all-targets --all-features config_delete_uses_a_durable_file_deletion_outbox -- --ignored
           cargo test --all-targets --all-features active_authorization_rejects_a_deleted_user_or_stale_token_version -- --ignored
           cargo test --all-targets --all-features database_encryption_key_rotation_is_transactional_and_idempotent -- --ignored
+          cargo test --all-targets --all-features cancellation_request_signals_the_worker_and_records_an_audit_event -- --ignored
+          cargo test --all-targets --all-features dashboard_stats_count_available_protection_and_terminal_outcomes -- --ignored
           cargo test --all-targets --all-features periodic_retention_sweeps_disabled_configs_without_a_new_success -- --ignored
           cargo test --all-targets --all-features expired_instance_lease_holds_advisory_lock_until_shutdown -- --ignored
           cargo test --all-targets --all-features instance_lease_blocks_takeover_after_advisory_session_loss -- --ignored

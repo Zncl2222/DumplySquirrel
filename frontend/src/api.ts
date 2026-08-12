@@ -23,6 +23,9 @@ export type BackupConfig = {
   email_notify_on: 'never' | 'failure' | 'always';
   created_at: string;
   updated_at: string;
+  last_run_status: string | null;
+  last_run_at: string | null;
+  last_success_at: string | null;
 };
 
 export type BackupHistory = {
@@ -61,11 +64,15 @@ export type RunningBackup = {
 
 export type DashboardStats = {
   total_configs: number;
+  protected_configs: number;
   total_backups: number;
   success_count: number;
   failed_count: number;
+  cancelled_count: number;
+  running_count: number;
   storage_bytes: number;
   pending_file_deletions: number;
+  last_success_at: string | null;
 };
 
 type ApiEnvelope<T> = { data: T };
@@ -153,6 +160,13 @@ export class ApiClient {
 
   triggerConfig(id: string) {
     return this.request<BackupHistory>(`/backup-configs/${id}/trigger`, { method: 'POST' });
+  }
+
+  cancelBackup(historyId: string) {
+    return this.request<{ history_id: string; cancellation_requested: boolean }>(
+      `/backup-history/${historyId}/cancel`,
+      { method: 'POST' },
+    );
   }
 
   history(query: HistoryQuery = {}) {

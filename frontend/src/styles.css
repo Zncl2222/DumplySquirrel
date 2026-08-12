@@ -491,6 +491,11 @@ nav button:hover,
   color: #735011;
 }
 
+.badge.cancelled {
+  background: #e7e9e4;
+  color: #4f5a4b;
+}
+
 .alert {
   background: #ffe0dc;
   border: 1px solid #f3aaa1;
@@ -772,8 +777,22 @@ nav button:hover,
 }
 
 .config-lastbackup {
+  align-items: start;
+  display: grid;
   font-size: 0.85rem;
+  gap: 0.3rem;
+  justify-items: start;
   white-space: nowrap;
+}
+
+.config-lastbackup time {
+  color: #41513d;
+}
+
+.config-lastbackup small,
+.config-lastbackup-never {
+  color: #778574;
+  font-size: 0.75rem;
 }
 
 .config-actions {
@@ -1052,6 +1071,11 @@ nav button:hover,
   flex-wrap: wrap;
   gap: 0.5rem;
   justify-content: flex-end;
+}
+
+.run-cancel {
+  padding: 0.55rem 0.85rem;
+  white-space: nowrap;
 }
 
 .run-facts {

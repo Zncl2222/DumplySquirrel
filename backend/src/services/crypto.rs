@@ -41,8 +41,7 @@ pub fn decrypt_string(ciphertext: &str, nonce: &str, key_material: &str) -> AppR
     let nonce_length = nonce.len();
     let nonce: [u8; AES_GCM_NONCE_BYTES] = nonce.try_into().map_err(|_| {
         AppError::Internal(anyhow::anyhow!(
-            "invalid AES-GCM nonce length: expected {AES_GCM_NONCE_BYTES} bytes, got {}",
-            nonce_length
+            "invalid AES-GCM nonce length: expected {AES_GCM_NONCE_BYTES} bytes, got {nonce_length}"
         ))
     })?;
     let nonce = Nonce::from(nonce);
