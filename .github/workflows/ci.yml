@@ -168,9 +168,10 @@ jobs:
           response_headers="${RUNNER_TEMP}/dumply-response-headers"
           curl --fail --silent --show-error --dump-header "$response_headers" \
             http://127.0.0.1:18080/api/health/ready >/dev/null
-          rg --ignore-case '^cache-control: no-store' "$response_headers"
-          rg --ignore-case "^content-security-policy:.*object-src 'none'" "$response_headers"
-          rg --ignore-case '^permissions-policy:' "$response_headers"
+          grep --extended-regexp --ignore-case '^cache-control: no-store' "$response_headers"
+          grep --extended-regexp --ignore-case \
+            "^content-security-policy:.*object-src 'none'" "$response_headers"
+          grep --extended-regexp --ignore-case '^permissions-policy:' "$response_headers"
 
       - name: Validate rendered HTTP Nginx config
         run: >-
