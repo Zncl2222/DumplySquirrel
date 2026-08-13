@@ -9,6 +9,15 @@ updates:
       timezone: Asia/Taipei
     open-pull-requests-limit: 5
 
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:05"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 5
+
   - package-ecosystem: cargo
     directory: /backend
     schedule:
