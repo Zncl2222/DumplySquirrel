@@ -37,7 +37,9 @@ fail-closed if the lock session is lost, so crash recovery cannot mistake anothe
 in-progress backup for an abandoned run. After an unclean database/backend restart, a replacement
 may wait up to 30 seconds for the old lease to expire.
 
-The dashboard is served by Nginx on `http://localhost` by default. The backend is available inside Docker Compose as `backend:3000` and is exposed through `/api`.
+The dashboard is served by Nginx on `http://localhost` by default. Plain HTTP binds to
+`127.0.0.1` unless `HTTP_BIND_ADDRESS` is explicitly changed. The backend is available inside
+Docker Compose as `backend:3000` and is exposed through `/api`.
 
 The backend exposes unauthenticated probes for container orchestrators and external monitors:
 
@@ -53,6 +55,9 @@ BACKUP_STORAGE_PATH=/mnt/storage/dumply/backups
 ```
 
 Relative paths such as `./backups` are resolved from the directory containing `docker-compose.yml`.
+Each run is capped by `MAX_BACKUP_FILE_BYTES` (100 GiB by default), and DumplySquirrel divides
+currently usable space across configured execution slots while preserving `MIN_FREE_DISK_BYTES`
+(1 GiB by default). Tune both values for the size and capacity of the production target.
 
 For production monitoring, cancellation behavior, restore drills, incident response, and the
 deployment checklist, see [docs/OPERATIONS.md](docs/OPERATIONS.md). A backup is not considered
@@ -78,6 +83,8 @@ docker compose -f docker-compose.yml -f docker-compose.tls.yml up --build
 ```
 
 The default non-TLS stack does not reserve the host's HTTPS port.
+HTTPS binds publicly by default through `HTTPS_BIND_ADDRESS=0.0.0.0`. If you also want a public
+HTTP-to-HTTPS redirect, set `HTTP_BIND_ADDRESS=0.0.0.0`; never expose the non-TLS mode publicly.
 
 The bundled Nginx rate-limits login requests by its direct client IP. If another load balancer or
 reverse proxy sits in front, configure trusted real-IP handling and login limiting at that outer
@@ -202,14 +209,21 @@ The host dev scripts stop the matching Docker dev app container first, so ports 
 - Manual trigger endpoint that starts a guarded background backup worker.
 - Asynchronous backup cancellation that terminates the dump process tree, removes partial output,
   records a `cancelled` terminal state, and exposes progress in the Run Room.
-- PostgreSQL backup via version-matched `pg_dump` using `PGPASSWORD` instead of password arguments.
-- MySQL backup via system `mysqldump` using a temporary option file instead of password arguments.
+- PostgreSQL backup via version-matched `pg_dump` using `PGPASSWORD` instead of password arguments;
+  libpq query parameters such as `sslmode=verify-full` are preserved in a password-free
+  connection URI.
+- MySQL backup via system `mysqldump` using a private temporary option file instead of password
+  arguments. `ssl-mode`, certificate paths, and TLS versions from the URL are validated and
+  translated to the bundled MariaDB-compatible client; dumps use `--single-transaction --quick`.
+- Target-database certificate paths are restricted to the dedicated read-only
+  `/etc/dumply-certs` mount configured by `DB_CERT_STORAGE_PATH`; dump subprocesses inherit only
+  an allowlisted environment and the credential for their own target.
 - Backup timeout handling, private atomic output files, restart recovery, and startup/hourly
   retention sweeps. Retention re-reads and locks the current policy, then queues file removal in
   the same durable cleanup outbox used by config deletion.
 - Cron scheduler using 6-field schedules (`sec min hour day month weekday`) for enabled configs.
-- Backup download streaming with an authenticated availability preflight and canonical
-  `BACKUP_DIR` path checks.
+- Backup download streaming with an authenticated availability preflight and atomic, no-symlink
+  opening of direct regular files under `BACKUP_DIR`.
 - Config deletion serializes against triggers, commits a durable file-deletion intent atomically,
   and retries managed-file cleanup without risking a database rollback that points at a lost file.
 - Readiness and liveness endpoints, with Docker health gating before Nginx starts.

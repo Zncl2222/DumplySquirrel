@@ -148,10 +148,36 @@ pub fn mask_database_url(input: &str) -> String {
             if url.password().is_some() {
                 let _ = url.set_password(Some("****"));
             }
+            let query = url
+                .query_pairs()
+                .map(|(key, value)| {
+                    let value = if is_sensitive_query_key(&key) {
+                        "****".to_string()
+                    } else {
+                        value.into_owned()
+                    };
+                    (key.into_owned(), value)
+                })
+                .collect::<Vec<_>>();
+            if !query.is_empty() {
+                url.query_pairs_mut().clear().extend_pairs(&query);
+            }
             url.to_string()
         }
         Err(_) => "****".to_string(),
     }
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.contains("password")
+        || normalized.contains("secret")
+        || normalized.ends_with("token")
+        || matches!(normalized.as_str(), "apikey" | "accesskey")
 }
 
 #[cfg(test)]

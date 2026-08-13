@@ -151,6 +151,27 @@ jobs:
       - name: Build frontend image
         run: docker build -t dumply-frontend:ci ./frontend
 
+      - name: Smoke test hardened production stack
+        env:
+          DB_PASSWORD: ci_db_password_strong
+          JWT_SECRET: ci_jwt_secret_with_at_least_32_bytes
+          DATABASE_ENCRYPTION_KEY: ci_database_encryption_key_32_bytes
+          ADMIN_PASSWORD: ci_admin_password_strong
+          HTTP_PORT: "18080"
+          BACKUP_STORAGE_PATH: ${{ runner.temp }}/dumply-ci-backups
+        run: |
+          cleanup() {
+            docker compose down --volumes --remove-orphans
+          }
+          trap cleanup EXIT
+          docker compose up --detach --build --wait --wait-timeout 120
+          response_headers="${RUNNER_TEMP}/dumply-response-headers"
+          curl --fail --silent --show-error --dump-header "$response_headers" \
+            http://127.0.0.1:18080/api/health/ready >/dev/null
+          rg --ignore-case '^cache-control: no-store' "$response_headers"
+          rg --ignore-case "^content-security-policy:.*object-src 'none'" "$response_headers"
+          rg --ignore-case '^permissions-policy:' "$response_headers"
+
       - name: Validate rendered HTTP Nginx config
         run: >-
           docker run --rm --add-host backend:127.0.0.1

@@ -3,6 +3,7 @@ use lettre::{
     AsyncTransport, Message, Tokio1Executor,
 };
 use sqlx::PgPool;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
@@ -21,6 +22,8 @@ struct NotificationHistory {
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
     triggered_by: String,
 }
+
+const SMTP_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn notify_backup_completed(
     pool: &PgPool,
@@ -127,10 +130,14 @@ async fn send_notification(
         ));
     }
 
-    transport_builder
-        .build()
-        .send(message)
+    tokio::time::timeout(SMTP_SEND_TIMEOUT, transport_builder.build().send(message))
         .await
+        .map_err(|_| {
+            AppError::Internal(anyhow::anyhow!(
+                "SMTP send timed out after {} seconds",
+                SMTP_SEND_TIMEOUT.as_secs()
+            ))
+        })?
         .map_err(|err| AppError::Internal(err.into()))?;
     Ok(())
 }

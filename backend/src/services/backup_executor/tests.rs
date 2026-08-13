@@ -3,8 +3,16 @@ use super::*;
 #[test]
 fn validates_matching_database_url_scheme() {
     assert!(validate_database_url("postgres", "postgres://user:pass@localhost/app").is_ok());
+    assert!(validate_database_url(
+        "postgres",
+        "postgres://user:pass@localhost/app?sslmode=verify-full&connect_timeout=10"
+    )
+    .is_ok());
     assert!(validate_database_url("mysql", "mysql://user:pass@localhost/app").is_ok());
     assert!(validate_database_url("mysql", "postgres://user:pass@localhost/app").is_err());
+    assert!(
+        validate_database_url("mysql", "mysql://user:pass@localhost/app?ssl-mode=required").is_ok()
+    );
 }
 
 #[test]
@@ -31,6 +39,18 @@ fn parses_supported_postgres_server_versions() {
 }
 
 #[test]
+fn mysql_server_versions_are_bounded_and_structured_before_logging() {
+    assert_eq!(
+        normalize_mysql_server_version("8.4.3-commercial\n").unwrap(),
+        "8.4.3-commercial"
+    );
+    assert_eq!(mysql_major_minor("8.4.3-commercial").unwrap(), "8.4");
+    assert!(normalize_mysql_server_version("8.x.0").is_err());
+    assert!(normalize_mysql_server_version("8.4\nforged").is_err());
+    assert!(normalize_mysql_server_version(&"8.4".repeat(100)).is_err());
+}
+
+#[test]
 fn parses_pg_dump_major_version() {
     assert_eq!(
         postgres_major_from_pg_dump_version("pg_dump (PostgreSQL) 16.4").unwrap(),
@@ -40,8 +60,9 @@ fn parses_pg_dump_major_version() {
 
 #[test]
 fn dump_target_applies_default_ports_and_decodes_components() {
-    let target = DumpTarget::parse("postgres://user%2Bname:pa%25ss@db.example.com/app%2Ddb")
-        .expect("target should parse");
+    let target =
+        DumpTarget::parse("postgres://user%2Bname:pa%25ss@db.example.com/app%2Ddb?sslmode=require")
+            .expect("target should parse");
 
     assert_eq!(target.scheme, "postgres");
     assert_eq!(target.host, "db.example.com");
@@ -49,10 +70,21 @@ fn dump_target_applies_default_ports_and_decodes_components() {
     assert_eq!(target.username, "user+name");
     assert_eq!(target.password.as_deref(), Some("pa%ss"));
     assert_eq!(target.database, "app-db");
+    assert!(!target.connection_url.contains("pa%25ss"));
+    assert!(target.connection_url.contains("sslmode=require"));
 
     let target = DumpTarget::parse("mysql://user:pass@db.example.com:3307/app")
         .expect("target should parse");
     assert_eq!(target.port, 3307);
+}
+
+#[test]
+fn postgres_connection_url_rejects_credential_overrides() {
+    assert!(
+        DumpTarget::parse("postgres://user:pass@localhost/app?password=other&sslmode=require")
+            .is_err()
+    );
+    assert!(DumpTarget::parse("postgres://user:pass@localhost/app#ignored").is_err());
 }
 
 #[test]
@@ -69,6 +101,11 @@ fn dump_target_rejects_missing_username_database_and_unsupported_scheme() {
         DumpTarget::parse("sqlite://user:pass@localhost/app"),
         Err(AppError::Validation(message)) if message == "unsupported db_url scheme"
     ));
+    assert!(DumpTarget::parse(&format!(
+        "postgres://user:pass@localhost/app?application_name={}",
+        "x".repeat(MAX_DATABASE_URL_BYTES)
+    ))
+    .is_err());
 }
 
 #[test]
@@ -87,6 +124,7 @@ fn mysql_option_file_contains_credentials_without_url_arguments() {
     let contents = std::fs::read_to_string(option_file.path()).unwrap();
 
     assert!(contents.contains("[client]"));
+    assert!(contents.contains("protocol=tcp"));
     assert!(contents.contains("host=\"localhost\""));
     assert!(contents.contains("port=3306"));
     assert!(contents.contains("user=\"user\""));
@@ -100,6 +138,119 @@ fn mysql_option_file_quotes_backslashes_and_quotes() {
     let contents = std::fs::read_to_string(option_file.path()).unwrap();
 
     assert!(contents.contains("password=\"p\\\\\\\"word\""));
+}
+
+#[test]
+fn mysql_tls_url_options_are_validated_and_written_to_the_private_option_file() {
+    let target = DumpTarget::parse(
+        "mysql://user:secret@localhost/app?ssl-mode=verify-identity&ssl-ca=%2Fetc%2Fdumply-certs%2Fca.pem&tls-version=TLSv1.2%2CTLSv1.3",
+    )
+    .unwrap();
+    let option_file = mysql_option_file(&target).unwrap();
+    let contents = std::fs::read_to_string(option_file.path()).unwrap();
+
+    assert!(contents.contains("ssl\n"));
+    assert!(contents.contains("ssl-verify-server-cert\n"));
+    assert!(contents.contains("ssl-ca=\"/etc/dumply-certs/ca.pem\""));
+    assert!(contents.contains("tls-version=\"TLSv1.2,TLSv1.3\""));
+    assert!(
+        DumpTarget::parse("mysql://user:secret@localhost/app?ssl-mode=verify-identity").is_err()
+    );
+    assert!(DumpTarget::parse(
+        "mysql://user:secret@localhost/app?ssl-mode=required&ssl-key=relative.pem"
+    )
+    .is_err());
+    assert!(DumpTarget::parse("mysql://user:secret@localhost/app?unknown=value").is_err());
+    assert!(DumpTarget::parse(
+        "mysql://user:secret@localhost/app?ssl-mode=verify-identity&ssl-ca=/etc/passwd"
+    )
+    .is_err());
+    assert!(DumpTarget::parse(
+        "postgres://user:secret@localhost/app?sslmode=verify-full&sslrootcert=/etc/dumply-certs/../passwd"
+    )
+    .is_err());
+    assert!(DumpTarget::parse(
+        "postgres://user:secret@localhost/app?sslmode=require&sslmode=disable"
+    )
+    .is_err());
+}
+
+#[test]
+fn child_environment_keeps_explicit_credentials_without_inheriting_backend_secrets() {
+    let mut command = Command::new("true");
+    command.env("PGPASSWORD", "target-password");
+    restrict_child_environment(&mut command);
+
+    let configured = command
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().to_string(),
+                value.map(|value| value.to_string_lossy().to_string()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        configured.get("PGPASSWORD"),
+        Some(&Some("target-password".into()))
+    );
+    assert_eq!(configured.get("HOME"), Some(&Some("/nonexistent".into())));
+    assert!(!configured.contains_key("JWT_SECRET"));
+    assert!(!configured.contains_key("DATABASE_ENCRYPTION_KEY"));
+    assert!(!configured.contains_key("ADMIN_PASSWORD"));
+}
+
+#[test]
+fn backup_file_limit_preserves_reserve_and_shares_capacity_between_execution_slots() {
+    assert_eq!(
+        calculate_backup_file_limit(101 << 30, 100 << 30, 1 << 30, 2).unwrap(),
+        50 << 30
+    );
+    assert_eq!(
+        calculate_backup_file_limit(500 << 30, 100 << 30, 1 << 30, 2).unwrap(),
+        100 << 30
+    );
+    assert!(calculate_backup_file_limit(1 << 30, 100 << 30, 1 << 30, 2).is_err());
+}
+
+#[test]
+fn backup_client_errors_are_bounded_and_safe_for_history_and_logs() {
+    let raw = format!(
+        "connection failed\npassword rejected\u{1b}[31m{}",
+        "x".repeat(3_000)
+    );
+    let sanitized = sanitize_backup_client_error(&raw);
+
+    assert!(!sanitized.chars().any(char::is_control));
+    assert!(sanitized.chars().count() <= 2_000);
+    assert!(sanitized.starts_with("connection failed password rejected"));
+    assert_eq!(
+        sanitize_backup_client_error("\n\t"),
+        "backup client exited unsuccessfully"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dump_process_cannot_write_past_its_file_size_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let output_path = directory.path().join("limited.sql");
+    let output = std::fs::File::create(&output_path).unwrap();
+    let mut command = Command::new("yes");
+    command
+        .arg("0123456789abcdef")
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::piped());
+    let limit = 64 * 1024;
+
+    let result = run_command("yes", command, 10, Some(limit), &CancellationToken::new()).await;
+
+    assert!(matches!(
+        result,
+        Err(AppError::Conflict(message)) if message.contains("configured output limit")
+    ));
+    assert!(std::fs::metadata(output_path).unwrap().len() <= limit);
 }
 
 #[test]
@@ -370,7 +521,7 @@ async fn command_cancellation_terminates_descendants_promptly() {
     let started = std::time::Instant::now();
 
     assert!(matches!(
-        run_command("sh", command, 30, &cancellation).await,
+        run_command("sh", command, 30, None, &cancellation).await,
         Err(AppError::BackupCancelled)
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
@@ -428,6 +579,8 @@ async fn cancellation_request_signals_the_worker_and_records_an_audit_event() {
             reset_admin_password_on_start: false,
             jwt_ttl_seconds: 60,
             max_concurrent_backups: 1,
+            max_backup_file_bytes: 100 * 1024 * 1024 * 1024,
+            min_free_disk_bytes: 1024 * 1024 * 1024,
             cors_allowed_origin: None,
             smtp: None,
         }),
@@ -454,7 +607,7 @@ async fn cancellation_request_signals_the_worker_and_records_an_audit_event() {
     .unwrap();
     assert_eq!(event.0, "cancel");
     assert_eq!(event.1, "warning");
-    assert!(event.2.contains("Cancellation requested"));
+    assert_eq!(event.2, "Cancellation requested by an operator.");
 
     sqlx::query("UPDATE backup_history SET status = 'cancelled' WHERE id = $1")
         .bind(history_id)
@@ -529,6 +682,8 @@ async fn periodic_retention_sweeps_disabled_configs_without_a_new_success() {
             reset_admin_password_on_start: false,
             jwt_ttl_seconds: 60,
             max_concurrent_backups: 1,
+            max_backup_file_bytes: 100 * 1024 * 1024 * 1024,
+            min_free_disk_bytes: 1024 * 1024 * 1024,
             cors_allowed_origin: None,
             smtp: None,
         }),

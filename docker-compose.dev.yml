@@ -35,6 +35,8 @@ services:
       RESET_ADMIN_PASSWORD_ON_START: ${RESET_ADMIN_PASSWORD_ON_START:-false}
       JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:-28800}
       MAX_CONCURRENT_BACKUPS: ${MAX_CONCURRENT_BACKUPS:-2}
+      MAX_BACKUP_FILE_BYTES: ${MAX_BACKUP_FILE_BYTES:-107374182400}
+      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-1073741824}
       ALLOW_INSECURE_DEV_SECRETS: ${DEV_ALLOW_INSECURE_SECRETS:-false}
       CORS_ALLOWED_ORIGIN: ${DEV_CORS_ALLOWED_ORIGIN:-http://localhost:5173}
       SMTP_HOST: ${SMTP_HOST:-}
@@ -52,6 +54,7 @@ services:
     volumes:
       - ./backend:/app
       - ${DEV_BACKUP_STORAGE_PATH:-./backups-dev}:/backups
+      - ${DB_CERT_STORAGE_PATH:-./certs/db}:/etc/dumply-certs:ro
       - cargo_target:/app/target
       - cargo_registry:/usr/local/cargo/registry
 

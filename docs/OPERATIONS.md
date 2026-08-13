@@ -9,10 +9,21 @@ backup mount, monitoring, and restore drills are operated.
 - Generate unique `DB_PASSWORD`, `JWT_SECRET`, `DATABASE_ENCRYPTION_KEY`, and `ADMIN_PASSWORD`
   values with `./scripts/init-env.sh`; do not deploy any `change_me_*` value.
 - Mount `BACKUP_STORAGE_PATH` on durable storage with enough capacity for the retention policy.
+- Make that directory writable by the backend container. The production service drops all Linux
+  capabilities, so it deliberately cannot bypass host ownership or mode bits on a bind mount.
+- Size `MAX_BACKUP_FILE_BYTES` and `MIN_FREE_DISK_BYTES` for that filesystem. The effective limit
+  of each run is the smaller of its configured cap and its safe share of currently available
+  space, so concurrent dumps cannot intentionally consume the reserved free space.
 - Replicate or snapshot that storage off-host. A bind mount on the database host is not an
   independent backup when that host is lost.
 - Terminate TLS either with the included TLS mode or a trusted upstream proxy. Restrict dashboard
   access to the intended operators.
+- Keep the default loopback-only HTTP bind unless it is used solely for a public HTTPS redirect.
+  Do not transmit dashboard passwords or bearer sessions over public plain HTTP.
+- Require encrypted target-database connections. For PostgreSQL, use `sslmode=verify-full` (and
+  the appropriate `sslrootcert`) in the target URL. For MySQL, use `ssl-mode=verify-identity` with
+  an absolute `ssl-ca` path mounted inside the backend container; also require TLS on the database
+  account so a client-side configuration mistake fails closed.
 - Configure SMTP and test at least one successful and one failed notification path when email is
   part of the incident workflow.
 - Send container logs to persistent log storage and configure the health/backup alerts below.
@@ -31,6 +42,31 @@ backup mount, monitoring, and restore drills are operated.
 
 The readiness probe deliberately creates and removes a randomized hidden file. A read-only or full
 mount therefore fails readiness even when directory metadata can still be listed.
+
+## Target database transport
+
+PostgreSQL connection parameters after `?` are passed to libpq through a password-free connection
+URI, while the password remains in `PGPASSWORD`. Identity and credential overrides such as
+`host`, `user`, `password`, `passfile`, and `service` are rejected so the audited target cannot be
+silently changed by a second parameter source. PostgreSQL certificate-path parameters are also
+restricted to traversal-free paths below the read-only `/etc/dumply-certs` mount. Example:
+
+```text
+postgres://backup_user:password@db.example.com/app?sslmode=verify-full&sslrootcert=/etc/dumply-certs/postgres-ca.pem
+```
+
+MySQL URLs accept only `ssl-mode`, `ssl-ca`, `ssl-capath`, `ssl-cert`, `ssl-key`, and
+`tls-version`. Supported modes are `disabled`, `required`, `verify-ca`, and `verify-identity`;
+`verify-ca` is deliberately strengthened to host-name verification by the bundled client. CA,
+certificate, and key paths must be traversal-free paths below `/etc/dumply-certs`. Put their host
+files under `DB_CERT_STORAGE_PATH`; Compose mounts that directory read-only. Example:
+
+```text
+mysql://backup_user:password@db.example.com/app?ssl-mode=verify-identity&ssl-ca=/etc/dumply-certs/mysql-ca.pem
+```
+
+Never place certificate-key passwords in URL query parameters. Independently configure the target
+database account to require TLS.
 
 ## Cancelling a backup
 

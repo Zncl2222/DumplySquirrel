@@ -20,7 +20,8 @@ use services::{
 use sqlx::PgPool;
 use tokio::sync::{Mutex, Semaphore};
 use tower_http::{
-    cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer,
+    cors::CorsLayer, limit::RequestBodyLimitLayer, set_header::SetResponseHeaderLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -94,7 +95,14 @@ async fn main() -> anyhow::Result<()> {
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(3600),
+            // Backup downloads return their streaming body promptly, so regular API work never
+            // needs an hour-long request future. Bound stalled database/client operations while
+            // allowing the response body itself to continue streaming through Nginx.
+            Duration::from_secs(60),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
         ))
         .layer(TraceLayer::new_for_http())
         .layer(cors)

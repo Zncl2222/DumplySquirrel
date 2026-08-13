@@ -1,5 +1,12 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api';
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 export type User = {
   id: string;
   username: string;
@@ -223,7 +230,7 @@ export class ApiClient {
       headers: this.headers(false),
     });
     if (!preflight.ok) {
-      throw new Error(await responseError(preflight));
+      throw await responseError(preflight);
     }
 
     // A native form download lets the browser stream the attachment directly to disk. Fetching
@@ -267,7 +274,7 @@ export class ApiClient {
       },
     });
     if (!response.ok) {
-      throw new Error(await responseError(response));
+      throw await responseError(response);
     }
     return (await response.json()) as T;
   }
@@ -287,9 +294,13 @@ export class ApiClient {
 async function responseError(response: Response) {
   try {
     const body = await response.json();
-    return body.error?.message ?? `Request failed with ${response.status}`;
+    return new ApiError(
+      body.error?.message ?? `Request failed with ${response.status}`,
+      response.status,
+      body.error?.code,
+    );
   } catch {
-    return `Request failed with ${response.status}`;
+    return new ApiError(`Request failed with ${response.status}`, response.status);
   }
 }
 

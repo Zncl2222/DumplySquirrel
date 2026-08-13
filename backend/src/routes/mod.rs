@@ -5,7 +5,7 @@ pub mod events;
 pub mod history;
 pub mod users;
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use axum::{
     http::StatusCode,
@@ -51,23 +51,46 @@ async fn readiness(axum::extract::State(state): axum::extract::State<AppState>) 
 }
 
 async fn readiness_response(state: &AppState) -> Response {
-    let database_ready = match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.db)
-        .await
-    {
-        Ok(_) => true,
-        Err(err) => {
+    const COMPONENT_TIMEOUT: Duration = Duration::from_secs(4);
+    let (database_result, storage_result) = tokio::join!(
+        tokio::time::timeout(
+            COMPONENT_TIMEOUT,
+            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.db),
+        ),
+        tokio::time::timeout(
+            COMPONENT_TIMEOUT,
+            backup_storage_ready(&state.config.backup_dir),
+        ),
+    );
+    let database_ready = match database_result {
+        Ok(Ok(_)) => true,
+        Ok(Err(err)) => {
             tracing::warn!(error = ?err, "configuration database readiness probe failed");
             false
         }
+        Err(_) => {
+            tracing::warn!(
+                timeout_seconds = COMPONENT_TIMEOUT.as_secs(),
+                "configuration database readiness probe timed out"
+            );
+            false
+        }
     };
-    let storage_ready = match backup_storage_ready(&state.config.backup_dir).await {
-        Ok(()) => true,
-        Err(err) => {
+    let storage_ready = match storage_result {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
             tracing::warn!(
                 path = %state.config.backup_dir.display(),
                 error = ?err,
                 "backup storage readiness probe failed"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                path = %state.config.backup_dir.display(),
+                timeout_seconds = COMPONENT_TIMEOUT.as_secs(),
+                "backup storage readiness probe timed out"
             );
             false
         }

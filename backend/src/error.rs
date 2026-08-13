@@ -27,6 +27,8 @@ pub enum AppError {
     BackupTimeout,
     #[error("backup was cancelled")]
     BackupCancelled,
+    #[error("backup client failed: {0}")]
+    BackupClient(String),
     #[error("backup output is sealed but its database commit is pending recovery: {0}")]
     BackupCommitPending(String),
     #[error("internal error")]
@@ -69,6 +71,11 @@ impl IntoResponse for AppError {
                 self.to_string(),
             ),
             Self::BackupCancelled => (StatusCode::CONFLICT, "BACKUP_CANCELLED", self.to_string()),
+            Self::BackupClient(_) => (
+                StatusCode::BAD_GATEWAY,
+                "BACKUP_CLIENT_ERROR",
+                self.to_string(),
+            ),
             Self::Internal(_) | Self::BackupCommitPending(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -76,7 +83,21 @@ impl IntoResponse for AppError {
             ),
         };
 
-        tracing::error!(error = ?self, "request failed");
+        if status.is_server_error() {
+            tracing::error!(error = ?self, "request failed");
+        } else if matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+        ) {
+            tracing::warn!(error = ?self, "request rejected");
+        } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND) {
+            // Authentication probes and missing resources are expected client traffic. Keeping
+            // them below the default production log level prevents brute-force attempts from
+            // becoming a log-volume denial of service; Nginx access logs still retain the request.
+            tracing::debug!(error = ?self, "request rejected");
+        } else {
+            tracing::info!(error = ?self, "request rejected");
+        }
         (
             status,
             Json(json!({ "error": { "code": code, "message": message } })),

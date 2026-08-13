@@ -16,6 +16,8 @@ fn test_config() -> AppConfig {
         reset_admin_password_on_start: false,
         jwt_ttl_seconds: 3600,
         max_concurrent_backups: 2,
+        max_backup_file_bytes: 100 * 1024 * 1024 * 1024,
+        min_free_disk_bytes: 1024 * 1024 * 1024,
         cors_allowed_origin: None,
         smtp: None,
     }

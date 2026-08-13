@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiClient, cronToHuman, formatBytes } from './api';
+import { ApiClient, ApiError, cronToHuman, formatBytes } from './api';
 
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
@@ -40,7 +40,9 @@ describe('ApiClient', () => {
   it('uses backend error messages when requests fail', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ error: { message: 'unauthorized' } }, { status: 401 })));
 
-    await expect(new ApiClient('bad-token').me()).rejects.toThrow('unauthorized');
+    const error = await new ApiClient('bad-token').me().catch((caught) => caught);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ message: 'unauthorized', status: 401 });
   });
 
   it('requests cancellation against the backup history resource', async () => {

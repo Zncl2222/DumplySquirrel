@@ -1,6 +1,7 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState, useDeferredValue } from 'react';
 import {
   ApiClient,
+  ApiError,
   BackupConfig,
   BackupEvent,
   BackupHistory,
@@ -230,19 +231,51 @@ export function App() {
   useEffect(() => {
     if (!token || !user) return;
     let cancelled = false;
+    let polling = false;
+    let timer: number | undefined;
+
+    function schedule(delay: number) {
+      if (cancelled) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(pollRunRoom, delay);
+    }
+
     async function pollRunRoom() {
+      if (cancelled || polling || document.visibilityState === 'hidden') return;
+      polling = true;
+      let nextDelay = 10_000;
       try {
         const runs = await api.runningBackups();
-        if (!cancelled) setRunningBackups(runs);
-      } catch {
+        if (!cancelled) {
+          setRunningBackups(runs);
+          nextDelay = runs.length > 0 ? 2_000 : 10_000;
+        }
+      } catch (err) {
         // Keep the global shell quiet during background polling.
+        if (!cancelled && err instanceof ApiError && err.status === 401) {
+          setToken(null);
+        }
+      } finally {
+        polling = false;
+        schedule(nextDelay);
       }
     }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        schedule(0);
+      } else if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     void pollRunRoom();
-    const timer = window.setInterval(pollRunRoom, 2000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [api, token, user]);
 
@@ -271,7 +304,7 @@ export function App() {
     } catch (err) {
       const message = err instanceof Error ? err.message : t('error.loadFailed');
       setError(message);
-      if (message.includes('unauthorized')) {
+      if (err instanceof ApiError && err.status === 401) {
         setToken(null);
       }
     } finally {
@@ -1092,7 +1125,18 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
     const historyId = selectedHistory.id;
     const isRunning = selectedHistory.status === 'running';
     let cancelled = false;
+    let loading = false;
+    let timer: number | undefined;
+
+    function schedule(delay: number) {
+      if (cancelled || !isRunning) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(loadEvents, delay);
+    }
+
     async function loadEvents() {
+      if (cancelled || loading || document.visibilityState === 'hidden') return;
+      loading = true;
       setEventsLoading(true);
       try {
         const [events, latestHistory] = await Promise.all([
@@ -1106,19 +1150,28 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : t('error.loadEventsFailed'));
       } finally {
+        loading = false;
         if (!cancelled) setEventsLoading(false);
+        schedule(2_000);
       }
     }
-    void loadEvents();
-    if (!isRunning) {
-      return () => {
-        cancelled = true;
-      };
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        if (isRunning) schedule(0);
+        else void loadEvents();
+      } else if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
     }
-    const timer = window.setInterval(loadEvents, 2000);
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    void loadEvents();
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [api, selectedHistory, setError]);
 

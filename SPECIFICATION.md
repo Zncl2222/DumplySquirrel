@@ -423,6 +423,10 @@ SERVER_NAME=backup.example.com
 HTTP_PORT=80
 HTTPS_PORT=443
 BACKUP_STORAGE_PATH=./backups
+MAX_CONCURRENT_BACKUPS=2
+MAX_BACKUP_FILE_BYTES=107374182400
+MIN_FREE_DISK_BYTES=1073741824
+DB_CERT_STORAGE_PATH=./certs/db
 
 # TLS (optional)
 ENABLE_TLS=false
@@ -634,9 +638,15 @@ DumplySquirrel/
 ### 11.2 備份執行安全
 
 - PostgreSQL / MySQL DSN 需明確解析，並安全傳遞帳密給 dump 工具；不得把密碼放在命令列參數。
+- PostgreSQL URL 的 libpq query parameters 必須透過移除密碼後的 connection URI 傳給
+  `psql` / `pg_dump`，不得默默忽略 `sslmode`。MySQL 僅接受明確列入白名單的 TLS
+  parameters，並寫入權限受限的 temporary option file；未知、重複或不完整的 TLS 設定必須拒絕。
+  兩者的憑證檔案路徑都只能位於唯讀的 `/etc/dumply-certs` 專用 mount。
 - 備份檔名由 `config_id + UTC timestamp` 組成，不使用使用者輸入的任務名稱。
 - 同一個 config 同時間只允許一個 running backup；全域需限制最大併發數，避免壓垮目標資料庫。
 - 每次備份有 timeout；逾時需 kill child process、標記 `timeout`，並清理不完整檔案。
+- 每個 dump process 需限制最大輸出檔案大小，並依最大併發數保留設定的最低磁碟可用空間；
+  超過限制時需終止且刪除 partial file，避免填滿主機磁碟。
 - 執行中備份可非同步取消；需終止整個 dump process group、清理 partial file、寫入事件，
   並將 history 標記為 `cancelled`。已完成封存/提交的競態可維持 `success`。
 - retention 清理同時依 `retention_days` 與 `max_backups` 執行；啟動時及每小時重跑。
