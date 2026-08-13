@@ -1,6 +1,7 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState, useDeferredValue } from 'react';
 import {
   ApiClient,
+  ApiError,
   BackupConfig,
   BackupEvent,
   BackupHistory,
@@ -230,19 +231,51 @@ export function App() {
   useEffect(() => {
     if (!token || !user) return;
     let cancelled = false;
+    let polling = false;
+    let timer: number | undefined;
+
+    function schedule(delay: number) {
+      if (cancelled) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(pollRunRoom, delay);
+    }
+
     async function pollRunRoom() {
+      if (cancelled || polling || document.visibilityState === 'hidden') return;
+      polling = true;
+      let nextDelay = 10_000;
       try {
         const runs = await api.runningBackups();
-        if (!cancelled) setRunningBackups(runs);
-      } catch {
+        if (!cancelled) {
+          setRunningBackups(runs);
+          nextDelay = runs.length > 0 ? 2_000 : 10_000;
+        }
+      } catch (err) {
         // Keep the global shell quiet during background polling.
+        if (!cancelled && err instanceof ApiError && err.status === 401) {
+          setToken(null);
+        }
+      } finally {
+        polling = false;
+        schedule(nextDelay);
       }
     }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        schedule(0);
+      } else if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     void pollRunRoom();
-    const timer = window.setInterval(pollRunRoom, 2000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [api, token, user]);
 
@@ -271,7 +304,7 @@ export function App() {
     } catch (err) {
       const message = err instanceof Error ? err.message : t('error.loadFailed');
       setError(message);
-      if (message.includes('unauthorized')) {
+      if (err instanceof ApiError && err.status === 401) {
         setToken(null);
       }
     } finally {
@@ -426,14 +459,19 @@ function LoginPage({ api, onLogin, error, setError }: { api: ApiClient; onLogin:
 function Dashboard({ stats, configs, history }: { stats: DashboardStats | null; configs: BackupConfig[]; history: BackupHistory[] }) {
   const { t } = useLanguage();
   const latest = history.slice(0, 6);
+  const totalConfigs = stats?.total_configs ?? configs.length;
+  const protectedConfigs = stats?.protected_configs ?? configs.filter((config) => config.last_success_at).length;
   return (
     <section className="grid">
-      <Metric title={t('dashboard.totalTasks')} value={stats?.total_configs ?? configs.length} />
+      <Metric title={t('dashboard.totalTasks')} value={totalConfigs} />
+      <Metric title={t('dashboard.protectedTasks')} value={`${protectedConfigs}/${totalConfigs}`} />
+      <Metric title={t('dashboard.runningNow')} value={stats?.running_count ?? history.filter((item) => item.status === 'running').length} />
       <Metric title={t('dashboard.totalBackups')} value={stats?.total_backups ?? history.length} />
       <Metric title={t('dashboard.success')} value={stats?.success_count ?? 0} />
       <Metric title={t('dashboard.failed')} value={stats?.failed_count ?? 0} />
       <Metric title={t('dashboard.storage')} value={formatBytes(stats?.storage_bytes)} />
       <Metric title={t('dashboard.pendingCleanup')} value={stats?.pending_file_deletions ?? 0} />
+      <Metric title={t('dashboard.lastSuccess')} value={formatTimestamp(stats?.last_success_at ?? null)} />
       <div className="panel wide">
         <h2>{t('dashboard.recentBackups')}</h2>
         <HistoryTable history={latest} configs={configs} compact />
@@ -457,7 +495,7 @@ const runStages = [
   { key: 'done', label: 'done' },
 ];
 
-function RunRoomDetail({ history, configName, events, loading, onBack }: { history: BackupHistory; configName: string; events: BackupEvent[]; loading: boolean; onBack: () => void }) {
+export function RunRoomDetail({ history, configName, events, loading, cancellationRequested, onBack, onCancel }: { history: BackupHistory; configName: string; events: BackupEvent[]; loading: boolean; cancellationRequested: boolean; onBack: () => void; onCancel: () => void }) {
   const { t } = useLanguage();
   const currentStage = stageFromEvents(events, history.status);
   const isRunning = history.status === 'running';
@@ -483,6 +521,11 @@ function RunRoomDetail({ history, configName, events, loading, onBack }: { histo
         <div className="run-detail-badges">
           <StatusBadge status={history.status} />
           {isRunning && <span className="run-polling">{t('history.detail.polling')}</span>}
+          {isRunning && (
+            <button className="danger run-cancel" disabled={cancellationRequested} onClick={onCancel}>
+              {cancellationRequested ? t('history.detail.cancellationRequested') : t('history.detail.cancelRun')}
+            </button>
+          )}
         </div>
       </header>
 
@@ -535,6 +578,7 @@ function stageFromEvents(events: BackupEvent[], status?: string) {
   if (last) return last;
   if (status === 'success') return 'done';
   if (status === 'failed' || status === 'timeout') return 'failed';
+  if (status === 'cancelled') return 'cancelled';
   return 'queued';
 }
 
@@ -555,6 +599,10 @@ function runDuration(history: BackupHistory) {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+}
+
+function formatTimestamp(value: string | null) {
+  return value ? new Date(value).toLocaleString() : '—';
 }
 
 function dbVersionOptions(dbType: 'postgres' | 'mysql') {
@@ -769,6 +817,7 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
                   <th>{t('configs.columns.version')}</th>
                   <th>{t('configs.columns.schedule')}</th>
                   <th>{t('configs.columns.retention')}</th>
+                  <th>{t('configs.columns.lastRun')}</th>
                   <th>{t('configs.columns.status')}</th>
                   <th></th>
                 </tr>
@@ -792,6 +841,19 @@ function Configs({ api, configs, runningBackups, refresh, setError, onViewHistor
                       <span className="notification-summary">{notificationSummary(config, t)}</span>
                     </td>
                     <td className="config-retention">{config.retention_days} {t('units.days')}</td>
+                    <td>
+                      {config.last_run_status ? (
+                        <div className="config-lastbackup">
+                          <StatusBadge status={config.last_run_status} />
+                          <time dateTime={config.last_run_at ?? undefined}>{formatTimestamp(config.last_run_at)}</time>
+                          {config.last_success_at && (
+                            <small>{t('configs.lastRun.lastSuccess', { time: formatTimestamp(config.last_success_at) })}</small>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="muted config-lastbackup-never">{t('configs.lastRun.never')}</span>
+                      )}
+                    </td>
                     <td><StatusBadge status={config.is_enabled ? 'enabled' : 'disabled'} /></td>
                     <td>
                       <div className="config-actions">
@@ -1037,6 +1099,7 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
   const [selectedHistory, setSelectedHistory] = useState<BackupHistory | null>(null);
   const [selectedEvents, setSelectedEvents] = useState<BackupEvent[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
+  const [cancellationRequestedFor, setCancellationRequestedFor] = useState<string | null>(null);
   const names = useMemo(() => new Map(configs.map((config) => [config.id, config.name])), [configs]);
   const selectedConfig = useMemo(() => configs.find((config) => config.id === selectedConfigId) ?? null, [configs, selectedConfigId]);
   const selectedConfigName = selectedConfig?.name ?? selectedConfigId?.slice(0, 8) ?? null;
@@ -1062,7 +1125,18 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
     const historyId = selectedHistory.id;
     const isRunning = selectedHistory.status === 'running';
     let cancelled = false;
+    let loading = false;
+    let timer: number | undefined;
+
+    function schedule(delay: number) {
+      if (cancelled || !isRunning) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(loadEvents, delay);
+    }
+
     async function loadEvents() {
+      if (cancelled || loading || document.visibilityState === 'hidden') return;
+      loading = true;
       setEventsLoading(true);
       try {
         const [events, latestHistory] = await Promise.all([
@@ -1076,19 +1150,28 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : t('error.loadEventsFailed'));
       } finally {
+        loading = false;
         if (!cancelled) setEventsLoading(false);
+        schedule(2_000);
       }
     }
-    void loadEvents();
-    if (!isRunning) {
-      return () => {
-        cancelled = true;
-      };
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        if (isRunning) schedule(0);
+        else void loadEvents();
+      } else if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
     }
-    const timer = window.setInterval(loadEvents, 2000);
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    void loadEvents();
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [api, selectedHistory, setError]);
 
@@ -1103,6 +1186,22 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
     setSelectedEvents([]);
   }
 
+  async function cancelSelectedRun() {
+    if (!selectedHistory || selectedHistory.status !== 'running') return;
+    if (!window.confirm(t('history.detail.cancelConfirm'))) return;
+    const historyId = selectedHistory.id;
+    setError(null);
+    setCancellationRequestedFor(historyId);
+    try {
+      await api.cancelBackup(historyId);
+      const events = await api.backupEvents(historyId);
+      setSelectedEvents(events);
+    } catch (err) {
+      setCancellationRequestedFor(null);
+      setError(err instanceof Error ? err.message : t('error.cancelBackupFailed'));
+    }
+  }
+
   if (selectedHistory) {
     const activeRun = runningBackups.find((run) => run.history.id === selectedHistory.id);
     const currentHistory = activeRun?.history ?? selectedHistory;
@@ -1112,7 +1211,9 @@ function History({ api, history, runningBackups, focusedHistory, configs, select
         configName={names.get(currentHistory.config_id) ?? currentHistory.config_id.slice(0, 8)}
         events={activeRun?.events ?? selectedEvents}
         loading={eventsLoading}
+        cancellationRequested={cancellationRequestedFor === currentHistory.id}
         onBack={closeDetail}
+        onCancel={() => void cancelSelectedRun()}
       />
     );
   }

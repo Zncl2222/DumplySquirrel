@@ -55,6 +55,9 @@ impl Drop for InstanceLock {
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
     Ok(PgPoolOptions::new()
         .max_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Some(Duration::from_secs(10 * 60)))
+        .max_lifetime(Some(Duration::from_secs(30 * 60)))
         .connect(database_url)
         .await?)
 }

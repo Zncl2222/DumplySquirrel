@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -17,6 +19,14 @@ use crate::{
     },
     AppState,
 };
+
+const MAX_CONFIG_NAME_CHARS: usize = 200;
+const MAX_CRON_CHARS: usize = 100;
+const MAX_EMAIL_ADDRESS_CHARS: usize = 320;
+const MAX_NOTIFICATION_RECIPIENTS: usize = 100;
+const MAX_RETENTION_DAYS: i32 = 36_500;
+const MAX_BACKUP_TIMEOUT_SECONDS: i32 = 7 * 24 * 60 * 60;
+const MAX_RETAINED_BACKUPS: i32 = 100_000;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -67,6 +77,17 @@ struct BackupConfigResponse {
     created_by: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    last_run_status: Option<String>,
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_success_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct BackupConfigRunState {
+    config_id: Uuid,
+    last_run_status: Option<String>,
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_success_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub(super) async fn list_configs(
@@ -90,9 +111,13 @@ pub(super) async fn list_configs(
     .fetch_all(&state.db)
     .await?;
 
+    let run_states = load_config_run_states(&state.db).await?;
     let data = configs
         .into_iter()
-        .map(|config| config_response(config, &state.config.database_encryption_key))
+        .map(|config| {
+            let run_state = run_states.get(&config.id);
+            config_response(config, &state.config.database_encryption_key, run_state)
+        })
         .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(json!({ "data": data })))
 }
@@ -107,6 +132,8 @@ pub(super) async fn create_config(
         .authorize_active(&headers, &state.config, &state.db)
         .await?;
     validate_payload(&payload)?;
+    let name = payload.name.trim().to_string();
+    let cron_schedule = normalize_cron_schedule(payload.cron_schedule.as_deref());
     let db_url = payload
         .db_url
         .as_deref()
@@ -138,12 +165,12 @@ pub(super) async fn create_config(
         "#,
     )
     .bind(Uuid::new_v4())
-    .bind(payload.name)
+    .bind(name)
     .bind(payload.db_type)
     .bind(db_version)
     .bind(ciphertext)
     .bind(nonce)
-    .bind(payload.cron_schedule)
+    .bind(cron_schedule)
     .bind(payload.is_enabled.unwrap_or(true))
     .bind(payload.retention_days)
     .bind(payload.timeout_seconds)
@@ -158,7 +185,7 @@ pub(super) async fn create_config(
     state.scheduler.refresh_config(config.id).await?;
 
     Ok(Json(json!({
-        "data": config_response(config, &state.config.database_encryption_key)?
+        "data": config_response(config, &state.config.database_encryption_key, None)?
     })))
 }
 
@@ -173,6 +200,8 @@ async fn update_config(
         .authorize_active(&headers, &state.config, &state.db)
         .await?;
     validate_payload(&payload)?;
+    let name = payload.name.trim().to_string();
+    let cron_schedule = normalize_cron_schedule(payload.cron_schedule.as_deref());
 
     let existing = sqlx::query_as::<_, BackupConfig>(
         r#"
@@ -238,12 +267,12 @@ async fn update_config(
         "#,
     )
     .bind(id)
-    .bind(payload.name)
+    .bind(name)
     .bind(payload.db_type)
     .bind(db_version)
     .bind(ciphertext)
     .bind(nonce)
-    .bind(payload.cron_schedule)
+    .bind(cron_schedule)
     .bind(payload.is_enabled.unwrap_or(true))
     .bind(payload.retention_days)
     .bind(payload.timeout_seconds)
@@ -257,7 +286,7 @@ async fn update_config(
     state.scheduler.refresh_config(config.id).await?;
 
     Ok(Json(json!({
-        "data": config_response(config, &state.config.database_encryption_key)?
+        "data": config_response(config, &state.config.database_encryption_key, None)?
     })))
 }
 
@@ -356,7 +385,7 @@ async fn toggle_config(
     .await?;
     state.scheduler.refresh_config(config.id).await?;
     Ok(Json(json!({
-        "data": config_response(config, &state.config.database_encryption_key)?
+        "data": config_response(config, &state.config.database_encryption_key, None)?
     })))
 }
 
@@ -381,27 +410,53 @@ fn validate_payload(payload: &BackupConfigRequest) -> AppResult<()> {
     if payload.name.trim().is_empty() {
         return Err(AppError::Validation("name is required".into()));
     }
+    if payload.name.chars().any(char::is_control) {
+        return Err(AppError::Validation(
+            "name must not contain control characters".into(),
+        ));
+    }
+    if payload.name.trim().chars().count() > MAX_CONFIG_NAME_CHARS {
+        return Err(AppError::Validation(format!(
+            "name must be at most {MAX_CONFIG_NAME_CHARS} characters"
+        )));
+    }
     if !matches!(payload.db_type.as_str(), "postgres" | "mysql") {
         return Err(AppError::Validation(
             "db_type must be postgres or mysql".into(),
         ));
     }
     validate_db_version(&payload.db_type, payload.db_version.as_deref())?;
-    if let Some(schedule) = &payload.cron_schedule {
-        scheduler::validate_cron_expression(schedule)?;
+    if let Some(schedule) = normalize_cron_schedule(payload.cron_schedule.as_deref()) {
+        if schedule.chars().count() > MAX_CRON_CHARS {
+            return Err(AppError::Validation(format!(
+                "cron_schedule must be at most {MAX_CRON_CHARS} characters"
+            )));
+        }
+        scheduler::validate_cron_expression(&schedule)?;
     }
-    if payload.retention_days.is_some_and(|value| value < 1) {
-        return Err(AppError::Validation(
-            "retention_days must be positive".into(),
-        ));
+    if payload
+        .retention_days
+        .is_some_and(|value| !(1..=MAX_RETENTION_DAYS).contains(&value))
+    {
+        return Err(AppError::Validation(format!(
+            "retention_days must be between 1 and {MAX_RETENTION_DAYS}"
+        )));
     }
-    if payload.timeout_seconds.is_some_and(|value| value < 1) {
-        return Err(AppError::Validation(
-            "timeout_seconds must be positive".into(),
-        ));
+    if payload
+        .timeout_seconds
+        .is_some_and(|value| !(1..=MAX_BACKUP_TIMEOUT_SECONDS).contains(&value))
+    {
+        return Err(AppError::Validation(format!(
+            "timeout_seconds must be between 1 and {MAX_BACKUP_TIMEOUT_SECONDS}"
+        )));
     }
-    if payload.max_backups.is_some_and(|value| value < 1) {
-        return Err(AppError::Validation("max_backups must be positive".into()));
+    if payload
+        .max_backups
+        .is_some_and(|value| !(1..=MAX_RETAINED_BACKUPS).contains(&value))
+    {
+        return Err(AppError::Validation(format!(
+            "max_backups must be between 1 and {MAX_RETAINED_BACKUPS}"
+        )));
     }
     let notify_on = normalize_notify_on(payload.email_notify_on.as_deref());
     if !matches!(notify_on.as_str(), "never" | "failure" | "always") {
@@ -411,12 +466,26 @@ fn validate_payload(payload: &BackupConfigRequest) -> AppResult<()> {
     }
     validate_email_list(&payload.email_to)?;
     validate_email_list(&payload.email_cc)?;
+    let recipient_count = normalize_email_list(&payload.email_to).len()
+        + normalize_email_list(&payload.email_cc).len();
+    if recipient_count > MAX_NOTIFICATION_RECIPIENTS {
+        return Err(AppError::Validation(format!(
+            "at most {MAX_NOTIFICATION_RECIPIENTS} email recipients are allowed"
+        )));
+    }
     if notify_on != "never" && normalize_email_list(&payload.email_to).is_empty() {
         return Err(AppError::Validation(
             "email_to is required when email notifications are enabled".into(),
         ));
     }
     Ok(())
+}
+
+fn normalize_cron_schedule(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn normalize_notify_on(value: Option<&str>) -> String {
@@ -428,20 +497,22 @@ fn normalize_notify_on(value: Option<&str>) -> String {
 }
 
 fn normalize_email_list(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(values.len());
     values
         .iter()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
-        .fold(Vec::new(), |mut acc, value| {
-            if !acc.contains(&value) {
-                acc.push(value);
-            }
-            acc
-        })
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
 }
 
 fn validate_email_list(values: &[String]) -> AppResult<()> {
     for email in normalize_email_list(values) {
+        if email.chars().count() > MAX_EMAIL_ADDRESS_CHARS {
+            return Err(AppError::Validation(format!(
+                "email address must be at most {MAX_EMAIL_ADDRESS_CHARS} characters"
+            )));
+        }
         if !is_valid_email(&email) {
             return Err(AppError::Validation(format!(
                 "invalid email address `{email}`"
@@ -452,7 +523,12 @@ fn validate_email_list(values: &[String]) -> AppResult<()> {
 }
 
 fn is_valid_email(value: &str) -> bool {
-    if value.contains(char::is_whitespace) || value.contains(['\n', '\r']) {
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+        || value.matches('@').count() != 1
+        || value.parse::<lettre::message::Mailbox>().is_err()
+    {
         return false;
     }
     let Some((local, domain)) = value.split_once('@') else {
@@ -461,7 +537,43 @@ fn is_valid_email(value: &str) -> bool {
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
-fn config_response(config: BackupConfig, encryption_key: &str) -> AppResult<BackupConfigResponse> {
+async fn load_config_run_states(
+    pool: &sqlx::PgPool,
+) -> AppResult<HashMap<Uuid, BackupConfigRunState>> {
+    let states = sqlx::query_as::<_, BackupConfigRunState>(
+        r#"
+        SELECT c.id AS config_id,
+               latest.status AS last_run_status,
+               latest.started_at AS last_run_at,
+               (
+                   SELECT MAX(success.completed_at)
+                   FROM backup_history success
+                   WHERE success.config_id = c.id AND success.status = 'success'
+               ) AS last_success_at
+        FROM backup_configs c
+        LEFT JOIN LATERAL (
+            SELECT history.status, history.started_at
+            FROM backup_history history
+            WHERE history.config_id = c.id
+            ORDER BY history.started_at DESC
+            LIMIT 1
+        ) latest ON TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(states
+        .into_iter()
+        .map(|state| (state.config_id, state))
+        .collect())
+}
+
+fn config_response(
+    config: BackupConfig,
+    encryption_key: &str,
+    run_state: Option<&BackupConfigRunState>,
+) -> AppResult<BackupConfigResponse> {
     let db_url = crypto::decrypt_string(
         &config.db_url_encrypted,
         &config.db_url_nonce,
@@ -484,6 +596,9 @@ fn config_response(config: BackupConfig, encryption_key: &str) -> AppResult<Back
         created_by: config.created_by,
         created_at: config.created_at,
         updated_at: config.updated_at,
+        last_run_status: run_state.and_then(|state| state.last_run_status.clone()),
+        last_run_at: run_state.and_then(|state| state.last_run_at),
+        last_success_at: run_state.and_then(|state| state.last_success_at),
     })
 }
 

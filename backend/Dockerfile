@@ -28,10 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client-17 \
     postgresql-client-18 \
     default-mysql-client \
-    && apt-get purge -y --auto-remove wget gnupg \
+    && apt-get purge -y --auto-remove gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/dumply-backend /usr/local/bin/dumply-backend
 
 EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD wget --quiet --tries=1 --output-document=/dev/null http://127.0.0.1:3000/api/health/ready || exit 1
 CMD ["dumply-backend"]

@@ -33,6 +33,14 @@ fn validate_payload_rejects_invalid_required_fields() {
     ));
 
     let mut payload = valid_payload();
+    payload.name = "x".repeat(MAX_CONFIG_NAME_CHARS + 1);
+    assert!(validate_payload(&payload).is_err());
+
+    let mut payload = valid_payload();
+    payload.name = "production\nforged-log".into();
+    assert!(validate_payload(&payload).is_err());
+
+    let mut payload = valid_payload();
     payload.db_type = "sqlite".into();
     assert!(matches!(
         validate_payload(&payload),
@@ -46,22 +54,34 @@ fn validate_payload_rejects_invalid_limits_and_versions() {
     payload.retention_days = Some(0);
     assert!(matches!(
         validate_payload(&payload),
-        Err(AppError::Validation(message)) if message == "retention_days must be positive"
+        Err(AppError::Validation(message)) if message.contains("retention_days must be between")
     ));
 
     let mut payload = valid_payload();
     payload.timeout_seconds = Some(0);
     assert!(matches!(
         validate_payload(&payload),
-        Err(AppError::Validation(message)) if message == "timeout_seconds must be positive"
+        Err(AppError::Validation(message)) if message.contains("timeout_seconds must be between")
     ));
 
     let mut payload = valid_payload();
     payload.max_backups = Some(0);
     assert!(matches!(
         validate_payload(&payload),
-        Err(AppError::Validation(message)) if message == "max_backups must be positive"
+        Err(AppError::Validation(message)) if message.contains("max_backups must be between")
     ));
+
+    let mut payload = valid_payload();
+    payload.timeout_seconds = Some(MAX_BACKUP_TIMEOUT_SECONDS + 1);
+    assert!(validate_payload(&payload).is_err());
+
+    let mut payload = valid_payload();
+    payload.cron_schedule = Some("   ".into());
+    assert!(validate_payload(&payload).is_ok());
+    assert_eq!(
+        normalize_cron_schedule(payload.cron_schedule.as_deref()),
+        None
+    );
 
     let mut payload = valid_payload();
     payload.db_version = Some("13".into());
@@ -96,6 +116,16 @@ fn validate_payload_rejects_invalid_email_notification_settings() {
         validate_payload(&payload),
         Err(AppError::Validation(message)) if message == "invalid email address `not-an-email`"
     ));
+
+    let mut payload = valid_payload();
+    payload.email_to = vec!["operator@ops@example.com".into()];
+    assert!(validate_payload(&payload).is_err());
+
+    let mut payload = valid_payload();
+    payload.email_to = (0..=MAX_NOTIFICATION_RECIPIENTS)
+        .map(|index| format!("operator-{index}@example.com"))
+        .collect();
+    assert!(validate_payload(&payload).is_err());
 }
 
 #[test]
@@ -177,6 +207,8 @@ fn test_backup_runtime(pool: sqlx::PgPool, database_url: String) -> backup_execu
         reset_admin_password_on_start: false,
         jwt_ttl_seconds: 60,
         max_concurrent_backups: 1,
+        max_backup_file_bytes: 100 * 1024 * 1024 * 1024,
+        min_free_disk_bytes: 1024 * 1024 * 1024,
         cors_allowed_origin: None,
         smtp: None,
     };
@@ -184,6 +216,9 @@ fn test_backup_runtime(pool: sqlx::PgPool, database_url: String) -> backup_execu
         db: pool,
         config: std::sync::Arc::new(config),
         permits: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        cancellations: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     }
 }
 

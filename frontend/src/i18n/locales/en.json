@@ -18,11 +18,14 @@
   "dashboard": {
     "title": "Dashboard",
     "totalTasks": "Tasks",
+    "protectedTasks": "Protected tasks",
+    "runningNow": "Running now",
     "totalBackups": "Backups",
     "success": "Success",
     "failed": "Failed",
     "storage": "Storage",
     "pendingCleanup": "Files pending cleanup",
+    "lastSuccess": "Last successful backup",
     "recentBackups": "Recent Backups"
   },
   "configs": {
@@ -37,7 +40,12 @@
       "version": "Version",
       "schedule": "Schedule",
       "retention": "Retention",
+      "lastRun": "Last Run",
       "status": "Status"
+    },
+    "lastRun": {
+      "never": "Never backed up",
+      "lastSuccess": "Last success: {time}"
     },
     "actions": {
       "history": "History",
@@ -109,7 +117,7 @@
       "notifyOn": "Send email on",
       "never": "Do not send",
       "failure": "Failure or timeout only",
-      "always": "Success and failure",
+      "always": "Every completed run",
       "to": "Recipients To",
       "cc": "Recipients CC",
       "toPlaceholder": "ops@company.com, dba@company.com",
@@ -163,7 +171,10 @@
       "eventsLoading": "Loading events",
       "noEvents": "No running backups yet. Events will appear here line by line after starting a task.",
       "waitingEvents": "Backup created, waiting for first event.",
-      "polling": "polling 2s"
+      "polling": "polling 2s",
+      "cancelRun": "Cancel backup",
+      "cancellationRequested": "Cancellation requested",
+      "cancelConfirm": "Cancel this backup? The dump process will be terminated and its partial file removed."
     }
   },
   "users": {
@@ -193,7 +204,8 @@
     "running": "running",
     "success": "success",
     "failed": "failed",
-    "timeout": "timeout"
+    "timeout": "timeout",
+    "cancelled": "cancelled"
   },
   "dbType": {
     "postgres": "PostgreSQL",
@@ -241,6 +253,7 @@
     "triggerBackupFailed": "Failed to trigger backup",
     "createUserFailed": "Failed to create user",
     "deleteUserFailed": "Failed to delete user",
-    "loadEventsFailed": "Failed to load events"
+    "loadEventsFailed": "Failed to load events",
+    "cancelBackupFailed": "Failed to cancel backup"
   }
 }

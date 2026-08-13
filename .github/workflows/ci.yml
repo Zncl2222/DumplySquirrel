@@ -18,20 +18,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Install pre-commit
-        run: python -m pip install pre-commit
+        run: python -m pip install pre-commit==4.6.2
 
       - name: Run pre-commit
         run: pre-commit run --all-files
@@ -58,11 +59,12 @@ jobs:
         working-directory: backend
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Check format
@@ -73,7 +75,7 @@ jobs:
 
       - name: Audit dependencies
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --version 0.22.2 --locked
           cargo audit
 
       - name: Test
@@ -87,6 +89,8 @@ jobs:
           cargo test --all-targets --all-features config_delete_uses_a_durable_file_deletion_outbox -- --ignored
           cargo test --all-targets --all-features active_authorization_rejects_a_deleted_user_or_stale_token_version -- --ignored
           cargo test --all-targets --all-features database_encryption_key_rotation_is_transactional_and_idempotent -- --ignored
+          cargo test --all-targets --all-features cancellation_request_signals_the_worker_and_records_an_audit_event -- --ignored
+          cargo test --all-targets --all-features dashboard_stats_count_available_protection_and_terminal_outcomes -- --ignored
           cargo test --all-targets --all-features periodic_retention_sweeps_disabled_configs_without_a_new_success -- --ignored
           cargo test --all-targets --all-features expired_instance_lease_holds_advisory_lock_until_shutdown -- --ignored
           cargo test --all-targets --all-features instance_lease_blocks_takeover_after_advisory_session_loss -- --ignored
@@ -99,10 +103,10 @@ jobs:
         working-directory: frontend
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: npm
@@ -125,7 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Test environment helpers
         run: |
@@ -148,6 +152,34 @@ jobs:
 
       - name: Build frontend image
         run: docker build -t dumply-frontend:ci ./frontend
+
+      - name: Smoke test hardened production stack
+        env:
+          DB_PASSWORD: ci_db_password_strong
+          JWT_SECRET: ci_jwt_secret_with_at_least_32_bytes
+          DATABASE_ENCRYPTION_KEY: ci_database_encryption_key_32_bytes
+          ADMIN_PASSWORD: ci_admin_password_strong
+          HTTP_PORT: "18080"
+          BACKUP_STORAGE_PATH: ${{ runner.temp }}/dumply-ci-backups
+        run: |
+          cleanup() {
+            docker compose down --volumes --remove-orphans
+          }
+          trap cleanup EXIT
+          docker compose up --detach --build --wait --wait-timeout 120
+          backend_id="$(docker compose ps --quiet backend)"
+          frontend_id="$(docker compose ps --quiet frontend)"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$backend_id")" = true
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$frontend_id")" = true
+          docker inspect --format '{{json .HostConfig.CapDrop}}' "$backend_id" | grep --quiet 'ALL'
+          docker inspect --format '{{json .HostConfig.CapDrop}}' "$frontend_id" | grep --quiet 'ALL'
+          response_headers="${RUNNER_TEMP}/dumply-response-headers"
+          curl --fail --silent --show-error --dump-header "$response_headers" \
+            http://127.0.0.1:18080/api/health/ready >/dev/null
+          grep --extended-regexp --ignore-case '^cache-control: no-store' "$response_headers"
+          grep --extended-regexp --ignore-case \
+            "^content-security-policy:.*object-src 'none'" "$response_headers"
+          grep --extended-regexp --ignore-case '^permissions-policy:' "$response_headers"
 
       - name: Validate rendered HTTP Nginx config
         run: >-

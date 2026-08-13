@@ -2,6 +2,9 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     environment:
       POSTGRES_DB: dumply_squirrel
       POSTGRES_USER: dumply
@@ -19,6 +22,14 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777,size=64m
     depends_on:
       postgres:
         condition: service_healthy
@@ -32,6 +43,8 @@ services:
       RESET_ADMIN_PASSWORD_ON_START: ${RESET_ADMIN_PASSWORD_ON_START:-false}
       JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:-28800}
       MAX_CONCURRENT_BACKUPS: ${MAX_CONCURRENT_BACKUPS:-2}
+      MAX_BACKUP_FILE_BYTES: ${MAX_BACKUP_FILE_BYTES:-107374182400}
+      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-1073741824}
       CORS_ALLOWED_ORIGIN: ${CORS_ALLOWED_ORIGIN:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
@@ -46,14 +59,33 @@ services:
       - "3000"
     volumes:
       - ${BACKUP_STORAGE_PATH:-./backups}:/backups
+      - ${DB_CERT_STORAGE_PATH:-./certs/db}:/etc/dumply-certs:ro
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - NET_BIND_SERVICE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    tmpfs:
+      - /etc/nginx/conf.d:rw,noexec,nosuid,nodev,size=1m
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m
+      - /var/run:rw,noexec,nosuid,nodev,size=1m
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777,size=16m
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     environment:
       NGINX_PORT: ${HTTP_PORT:-80}
       NGINX_HTTPS_PORT: ${HTTPS_PORT:-443}
@@ -62,7 +94,7 @@ services:
       TLS_CERT_FILE: /etc/nginx/certs/fullchain.pem
       TLS_KEY_FILE: /etc/nginx/certs/privkey.pem
     ports:
-      - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
+      - "${HTTP_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-80}:${HTTP_PORT:-80}"
     volumes:
       - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
 

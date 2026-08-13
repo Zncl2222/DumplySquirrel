@@ -18,11 +18,14 @@
   "dashboard": {
     "title": "Dashboard",
     "totalTasks": "任務數",
+    "protectedTasks": "已有成功備份",
+    "runningNow": "執行中",
     "totalBackups": "備份次數",
     "success": "成功",
     "failed": "失敗",
     "storage": "儲存用量",
     "pendingCleanup": "等待清理的檔案",
+    "lastSuccess": "最近成功備份",
     "recentBackups": "最近備份"
   },
   "configs": {
@@ -37,7 +40,12 @@
       "version": "版本",
       "schedule": "排程",
       "retention": "保留",
+      "lastRun": "最近執行",
       "status": "狀態"
+    },
+    "lastRun": {
+      "never": "尚未備份",
+      "lastSuccess": "最近成功：{time}"
     },
     "actions": {
       "history": "歷史",
@@ -109,7 +117,7 @@
       "notifyOn": "寄信時機",
       "never": "不寄信",
       "failure": "失敗或 timeout 才寄",
-      "always": "成功與失敗都寄",
+      "always": "每次結束都寄",
       "to": "收件人 To",
       "cc": "副本 CC",
       "toPlaceholder": "ops@company.com, dba@company.com",
@@ -163,7 +171,10 @@
       "eventsLoading": "載入事件中",
       "noEvents": "還沒有正在執行的備份。啟動任務後，事件會在這裡逐行出現。",
       "waitingEvents": "備份已建立，正在等待第一筆事件。",
-      "polling": "polling 2s"
+      "polling": "polling 2s",
+      "cancelRun": "取消備份",
+      "cancellationRequested": "已送出取消要求",
+      "cancelConfirm": "確定要取消這筆備份嗎？系統會終止 dump 程序並刪除未完成的檔案。"
     }
   },
   "users": {
@@ -193,7 +204,8 @@
     "running": "running",
     "success": "success",
     "failed": "failed",
-    "timeout": "timeout"
+    "timeout": "timeout",
+    "cancelled": "cancelled"
   },
   "dbType": {
     "postgres": "PostgreSQL",
@@ -241,6 +253,7 @@
     "triggerBackupFailed": "啟動備份失敗",
     "createUserFailed": "建立使用者失敗",
     "deleteUserFailed": "刪除使用者失敗",
-    "loadEventsFailed": "載入流程事件失敗"
+    "loadEventsFailed": "載入流程事件失敗",
+    "cancelBackupFailed": "取消備份失敗"
   }
 }

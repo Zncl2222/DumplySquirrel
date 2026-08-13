@@ -1,0 +1,5 @@
+[advisories]
+# `rsa` is present only in Cargo.lock through sqlx's optional MySQL driver metadata. The backend
+# disables sqlx default features and enables only the PostgreSQL driver; `cargo tree --target all
+# -i rsa` is empty, so the affected crate is not compiled or shipped. No fixed rsa release exists.
+ignore = ["RUSTSEC-2023-0071"]

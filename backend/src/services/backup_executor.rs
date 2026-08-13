@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io,
     path::{Component, Path, PathBuf},
@@ -11,7 +12,12 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use sqlx::PgPool;
 use tempfile::NamedTempFile;
-use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::{Mutex, Semaphore},
+};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -21,10 +27,20 @@ use crate::{
     services::{crypto, email_notifier},
 };
 
+const TARGET_CERTIFICATE_DIR: &str = "/etc/dumply-certs";
+const MAX_DATABASE_URL_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 enum BackupFinalStatus {
     Success,
     Timeout,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DumpExecutionLimits {
+    timeout_seconds: i32,
+    max_output_bytes: u64,
 }
 
 impl BackupFinalStatus {
@@ -32,6 +48,7 @@ impl BackupFinalStatus {
         match self {
             Self::Success => "success",
             Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -41,6 +58,7 @@ pub struct BackupRuntime {
     pub db: PgPool,
     pub config: Arc<AppConfig>,
     pub permits: Arc<Semaphore>,
+    pub cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,14 +83,64 @@ pub async fn spawn_backup(
 ) -> AppResult<BackupHistory> {
     let (config, history) = prepare_backup(&runtime.db, config_id, trigger).await?;
     let history_id = history.id;
+    let cancellation = CancellationToken::new();
+    runtime
+        .cancellations
+        .lock()
+        .await
+        .insert(history_id, cancellation.clone());
 
     tokio::spawn(async move {
-        if let Err(err) = run_backup(runtime, config, history_id).await {
+        if let Err(err) = run_backup(runtime.clone(), config, history_id, cancellation).await {
             tracing::error!(history_id = %history_id, error = ?err, "backup worker failed");
         }
+        runtime.cancellations.lock().await.remove(&history_id);
     });
 
     Ok(history)
+}
+
+pub async fn request_backup_cancellation(
+    runtime: &BackupRuntime,
+    history_id: Uuid,
+) -> AppResult<()> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM backup_history WHERE id = $1")
+            .bind(history_id)
+            .fetch_optional(&runtime.db)
+            .await?;
+    let Some(status) = status else {
+        return Err(AppError::NotFound);
+    };
+    if status != "running" {
+        return Err(AppError::Conflict(format!(
+            "backup is already {status} and cannot be cancelled"
+        )));
+    }
+
+    let cancellation = runtime
+        .cancellations
+        .lock()
+        .await
+        .get(&history_id)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "backup worker is no longer active; refresh its status and try again".into(),
+            )
+        })?;
+    // Stop the process immediately; recording the audit event must not delay cancellation if the
+    // configuration database is briefly slow.
+    cancellation.cancel();
+    backup_event(
+        &runtime.db,
+        history_id,
+        "cancel",
+        "warning",
+        "Cancellation requested by an operator.",
+    )
+    .await;
+    Ok(())
 }
 
 async fn prepare_backup(
@@ -130,6 +198,7 @@ async fn run_backup(
     runtime: BackupRuntime,
     config: BackupConfig,
     history_id: Uuid,
+    cancellation: CancellationToken,
 ) -> AppResult<()> {
     backup_event(
         &runtime.db,
@@ -139,11 +208,29 @@ async fn run_backup(
         "Backup worker queued for an execution slot.",
     )
     .await;
-    let permit_result = tokio::time::timeout(
-        Duration::from_secs(30),
-        runtime.permits.clone().acquire_owned(),
-    )
-    .await;
+    let permit_result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            mark_cancelled(
+                &runtime,
+                history_id,
+                "Backup cancelled while waiting for an execution slot.",
+            )
+            .await?;
+            email_notifier::notify_backup_completed(
+                &runtime.db,
+                &runtime.config,
+                &config,
+                history_id,
+                "cancelled",
+            )
+            .await;
+            return Ok(());
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(30),
+            runtime.permits.clone().acquire_owned(),
+        ) => result,
+    };
     let permit = match permit_result {
         Ok(Ok(permit)) => permit,
         Ok(Err(err)) => {
@@ -184,7 +271,7 @@ async fn run_backup(
     )
     .await;
 
-    let result = execute_backup(&runtime, &config, history_id).await;
+    let result = execute_backup(&runtime, &config, history_id, &cancellation).await;
     drop(permit);
 
     match result {
@@ -225,10 +312,81 @@ async fn run_backup(
     Ok(())
 }
 
+async fn mark_cancelled(runtime: &BackupRuntime, history_id: Uuid, message: &str) -> AppResult<()> {
+    backup_event(&runtime.db, history_id, "cancelled", "warning", message).await;
+    mark_failed_if_running(&runtime.db, history_id, "cancelled", message).await?;
+    Ok(())
+}
+
 const RESTART_INTERRUPTION_MESSAGE: &str =
     "Backup interrupted because the service restarted before completion.";
 const RESTART_COMMIT_MESSAGE: &str =
     "Backup file was already finalized; startup recovery committed the run successfully.";
+const MIN_EXECUTABLE_BACKUP_BYTES: u64 = 1024 * 1024;
+const STORAGE_CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn backup_file_size_limit(config: &AppConfig) -> AppResult<u64> {
+    let backup_dir = config.backup_dir.clone();
+    let probe = tokio::task::spawn_blocking(move || available_disk_bytes(&backup_dir));
+    let available_bytes = match tokio::time::timeout(STORAGE_CAPACITY_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(Ok(available_bytes))) => available_bytes,
+        Ok(Ok(Err(err))) => {
+            return Err(AppError::Conflict(format!(
+                "could not inspect free backup storage: {err}"
+            )))
+        }
+        Ok(Err(err)) => return Err(AppError::Internal(err.into())),
+        Err(_) => {
+            return Err(AppError::Conflict(format!(
+                "backup storage capacity probe timed out after {} seconds",
+                STORAGE_CAPACITY_PROBE_TIMEOUT.as_secs()
+            )))
+        }
+    };
+
+    calculate_backup_file_limit(
+        available_bytes,
+        config.max_backup_file_bytes,
+        config.min_free_disk_bytes,
+        config.max_concurrent_backups,
+    )
+}
+
+fn calculate_backup_file_limit(
+    available_bytes: u64,
+    configured_max_bytes: u64,
+    reserved_bytes: u64,
+    max_concurrent_backups: usize,
+) -> AppResult<u64> {
+    let usable_bytes = available_bytes.saturating_sub(reserved_bytes);
+    let fair_share = usable_bytes / max_concurrent_backups.max(1) as u64;
+    let limit = configured_max_bytes.min(fair_share);
+    if limit < MIN_EXECUTABLE_BACKUP_BYTES {
+        return Err(AppError::Conflict(format!(
+            "insufficient backup storage: {available_bytes} bytes are available, {reserved_bytes} bytes must remain free, and each execution slot requires at least {MIN_EXECUTABLE_BACKUP_BYTES} bytes"
+        )));
+    }
+    Ok(limit)
+}
+
+#[cfg(unix)]
+fn available_disk_bytes(path: &Path) -> io::Result<u64> {
+    use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "backup path contains NUL"))?;
+    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn available_disk_bytes(_path: &Path) -> io::Result<u64> {
+    Ok(u64::MAX)
+}
 
 /// Marks runs abandoned by a previous process as terminal before the scheduler starts.
 ///
@@ -333,7 +491,17 @@ async fn execute_backup(
     runtime: &BackupRuntime,
     config: &BackupConfig,
     history_id: Uuid,
+    cancellation: &CancellationToken,
 ) -> AppResult<BackupFinalStatus> {
+    if cancellation.is_cancelled() {
+        mark_cancelled(
+            runtime,
+            history_id,
+            "Backup cancelled before execution started.",
+        )
+        .await?;
+        return Ok(BackupFinalStatus::Cancelled);
+    }
     tokio::fs::create_dir_all(&runtime.config.backup_dir)
         .await
         .map_err(|err| AppError::Internal(err.into()))?;
@@ -343,6 +511,17 @@ async fn execute_backup(
         "prepare",
         "success",
         "Backup directory is ready.",
+    )
+    .await;
+    let max_output_bytes = backup_file_size_limit(&runtime.config).await?;
+    backup_event(
+        &runtime.db,
+        history_id,
+        "prepare",
+        "info",
+        &format!(
+            "This run may write at most {max_output_bytes} bytes while preserving the configured free-space reserve."
+        ),
     )
     .await;
 
@@ -387,6 +566,10 @@ async fn execute_backup(
         &format!("Output file reserved as `{file_name}`."),
     )
     .await;
+    let limits = DumpExecutionLimits {
+        timeout_seconds: config.timeout_seconds,
+        max_output_bytes,
+    };
 
     let dump_result = match config.db_type.as_str() {
         "postgres" => {
@@ -396,7 +579,8 @@ async fn execute_backup(
                 &target,
                 output_file,
                 config.db_version.as_deref(),
-                config.timeout_seconds,
+                limits,
+                cancellation,
             )
             .await
         }
@@ -407,11 +591,22 @@ async fn execute_backup(
                 &target,
                 output_file,
                 config.db_version.as_deref(),
-                config.timeout_seconds,
+                limits,
+                cancellation,
             )
             .await
         }
         other => Err(AppError::Validation(format!("unsupported db_type {other}"))),
+    };
+
+    let dump_result = match dump_result {
+        Ok(()) if cancellation.is_cancelled() => Err(AppError::BackupCancelled),
+        Ok(()) => match tokio::fs::metadata(&partial_path).await {
+            Ok(metadata) if metadata.len() <= max_output_bytes => Ok(()),
+            Ok(_) => Err(backup_size_limit_error(max_output_bytes)),
+            Err(err) => Err(AppError::Internal(err.into())),
+        },
+        result => result,
     };
 
     match dump_result {
@@ -519,6 +714,13 @@ async fn execute_backup(
             )
             .await?;
             Ok(BackupFinalStatus::Timeout)
+        }
+        Err(AppError::BackupCancelled) => {
+            cleanup_partial_file(&partial_path).await;
+            let message = "Backup cancelled by an administrator. Partial file was removed.";
+            backup_event(&runtime.db, history_id, "cancelled", "warning", message).await;
+            mark_failed(&runtime.db, history_id, "cancelled", message, None).await?;
+            Ok(BackupFinalStatus::Cancelled)
         }
         Err(err) => {
             cleanup_partial_file(&partial_path).await;
@@ -648,7 +850,8 @@ async fn run_pg_dump(
     target: &DumpTarget,
     output: File,
     configured_version: Option<&str>,
-    timeout_seconds: i32,
+    limits: DumpExecutionLimits,
+    cancellation: &CancellationToken,
 ) -> AppResult<()> {
     let configured_version = configured_version
         .map(str::trim)
@@ -674,7 +877,9 @@ async fn run_pg_dump(
                 "Detecting PostgreSQL server version.",
             )
             .await;
-            let version = detect_postgres_major_version(target, timeout_seconds).await?;
+            let version =
+                detect_postgres_major_version(target, limits.timeout_seconds, Some(cancellation))
+                    .await?;
             backup_event(
                 pool,
                 history_id,
@@ -686,7 +891,7 @@ async fn run_pg_dump(
             version
         }
     };
-    let command_path = resolve_pg_dump_command(&major_version).await?;
+    let command_path = resolve_pg_dump_command(&major_version, Some(cancellation)).await?;
     tracing::info!(postgres_version = %major_version, pg_dump = %command_path, "using PostgreSQL pg_dump client");
     backup_event(
         pool,
@@ -698,14 +903,9 @@ async fn run_pg_dump(
     .await;
     let mut command = Command::new(&command_path);
     command
-        .arg("-h")
-        .arg(&target.host)
-        .arg("-p")
-        .arg(target.port.to_string())
-        .arg("-U")
-        .arg(&target.username)
-        .arg("-d")
-        .arg(&target.database)
+        .arg("--dbname")
+        .arg(&target.connection_url)
+        .arg("--no-password")
         .stdout(Stdio::from(output))
         .stderr(Stdio::piped());
     if let Some(password) = &target.password {
@@ -713,7 +913,14 @@ async fn run_pg_dump(
     }
 
     backup_event(pool, history_id, "dump", "info", "pg_dump process started.").await;
-    run_command(&command_path, command, timeout_seconds).await?;
+    run_command(
+        &command_path,
+        command,
+        limits.timeout_seconds,
+        Some(limits.max_output_bytes),
+        cancellation,
+    )
+    .await?;
     backup_event(
         pool,
         history_id,
@@ -731,7 +938,8 @@ async fn run_mysqldump(
     target: &DumpTarget,
     output: File,
     configured_version: Option<&str>,
-    timeout_seconds: i32,
+    limits: DumpExecutionLimits,
+    cancellation: &CancellationToken,
 ) -> AppResult<()> {
     let configured_version = configured_version
         .map(str::trim)
@@ -757,7 +965,8 @@ async fn run_mysqldump(
                 "Detecting MySQL server version.",
             )
             .await;
-            let version = detect_mysql_version(target, timeout_seconds).await?;
+            let version =
+                detect_mysql_version(target, limits.timeout_seconds, Some(cancellation)).await?;
             backup_event(
                 pool,
                 history_id,
@@ -782,7 +991,9 @@ async fn run_mysqldump(
     let option_path = option_file.path().to_path_buf();
     let mut command = Command::new("mysqldump");
     command
-        .arg(format!("--defaults-extra-file={}", option_path.display()))
+        .arg(format!("--defaults-file={}", option_path.display()))
+        .arg("--single-transaction")
+        .arg("--quick")
         .arg("--")
         .arg(&target.database)
         .stdout(Stdio::from(output))
@@ -796,7 +1007,14 @@ async fn run_mysqldump(
         "mysqldump process started.",
     )
     .await;
-    let result = run_command("mysqldump", command, timeout_seconds).await;
+    let result = run_command(
+        "mysqldump",
+        command,
+        limits.timeout_seconds,
+        Some(limits.max_output_bytes),
+        cancellation,
+    )
+    .await;
     drop(option_file);
     if result.is_ok() {
         backup_event(
@@ -814,17 +1032,13 @@ async fn run_mysqldump(
 async fn detect_postgres_major_version(
     target: &DumpTarget,
     timeout_seconds: i32,
+    cancellation: Option<&CancellationToken>,
 ) -> AppResult<String> {
     let mut command = Command::new("psql");
     command
-        .arg("-h")
-        .arg(&target.host)
-        .arg("-p")
-        .arg(target.port.to_string())
-        .arg("-U")
-        .arg(&target.username)
-        .arg("-d")
-        .arg(&target.database)
+        .arg("--dbname")
+        .arg(&target.connection_url)
+        .arg("--no-password")
         .arg("-tA")
         .arg("-c")
         .arg("SHOW server_version_num")
@@ -834,11 +1048,14 @@ async fn detect_postgres_major_version(
         command.env("PGPASSWORD", password);
     }
 
-    let output = run_command_output("psql", command, timeout_seconds).await?;
+    let output = run_command_output("psql", command, timeout_seconds, cancellation).await?;
     postgres_major_from_server_version_num(output.trim())
 }
 
-async fn resolve_pg_dump_command(major_version: &str) -> AppResult<String> {
+async fn resolve_pg_dump_command(
+    major_version: &str,
+    cancellation: Option<&CancellationToken>,
+) -> AppResult<String> {
     let managed_path = format!("/usr/lib/postgresql/{major_version}/bin/pg_dump");
     let mut candidates = Vec::new();
     if Path::new(&managed_path).exists() {
@@ -847,30 +1064,37 @@ async fn resolve_pg_dump_command(major_version: &str) -> AppResult<String> {
     candidates.push("pg_dump".to_string());
 
     for candidate in candidates {
-        match command_postgres_major(&candidate).await {
+        match command_postgres_major(&candidate, cancellation).await {
             Ok(candidate_major) if candidate_major == major_version => return Ok(candidate),
             _ => {}
         }
     }
 
-    Err(AppError::Internal(anyhow::anyhow!(
+    Err(AppError::BackupClient(format!(
         "pg_dump client for PostgreSQL {major_version} is not installed; install postgresql-client-{major_version} or put a matching pg_dump in PATH"
     )))
 }
 
-async fn command_postgres_major(command_path: &str) -> AppResult<String> {
+async fn command_postgres_major(
+    command_path: &str,
+    cancellation: Option<&CancellationToken>,
+) -> AppResult<String> {
     let mut command = Command::new(command_path);
     command.arg("--version");
-    let output = run_command_output(command_path, command, 10).await?;
+    let output = run_command_output(command_path, command, 10, cancellation).await?;
     postgres_major_from_pg_dump_version(&output)
 }
 
-async fn detect_mysql_version(target: &DumpTarget, timeout_seconds: i32) -> AppResult<String> {
+async fn detect_mysql_version(
+    target: &DumpTarget,
+    timeout_seconds: i32,
+    cancellation: Option<&CancellationToken>,
+) -> AppResult<String> {
     let option_file = mysql_option_file(target)?;
     let option_path = option_file.path().to_path_buf();
     let mut command = Command::new("mysql");
     command
-        .arg(format!("--defaults-extra-file={}", option_path.display()))
+        .arg(format!("--defaults-file={}", option_path.display()))
         .arg("-N")
         .arg("-B")
         .arg(&target.database)
@@ -879,29 +1103,71 @@ async fn detect_mysql_version(target: &DumpTarget, timeout_seconds: i32) -> AppR
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
 
-    let result = run_command_output("mysql", command, timeout_seconds).await;
+    let result = run_command_output("mysql", command, timeout_seconds, cancellation).await;
     drop(option_file);
-    result.map(|output| output.trim().to_string())
+    result.and_then(|output| normalize_mysql_server_version(&output))
+}
+
+fn normalize_mysql_server_version(output: &str) -> AppResult<String> {
+    const MAX_VERSION_CHARS: usize = 100;
+
+    let version = output.trim();
+    if version.is_empty()
+        || version.chars().count() > MAX_VERSION_CHARS
+        || version.chars().any(char::is_control)
+    {
+        return Err(AppError::BackupClient(
+            "MySQL server returned an invalid version string".into(),
+        ));
+    }
+    mysql_major_minor(version)?;
+    Ok(version.to_string())
+}
+
+fn mysql_major_minor(version: &str) -> AppResult<String> {
+    let mut parts = version.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.chars().all(|character| character.is_ascii_digit())
+        || !minor.chars().all(|character| character.is_ascii_digit())
+    {
+        return Err(AppError::BackupClient(
+            "failed to parse MySQL server version".into(),
+        ));
+    }
+    Ok(format!("{major}.{minor}"))
 }
 
 async fn run_command_output(
     command_name: &str,
     mut command: Command,
     timeout_seconds: i32,
+    cancellation: Option<&CancellationToken>,
 ) -> AppResult<String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    configure_child_process(&mut command);
+    configure_child_process(&mut command, None);
     let mut child = command
         .spawn()
         .map_err(|err| command_spawn_error(command_name, err))?;
     let mut stdout_task = tokio::spawn(read_stream(child.stdout.take()));
     let mut stderr_task = tokio::spawn(read_stream(child.stderr.take()));
-    let status = match tokio::time::timeout(
-        Duration::from_secs(timeout_seconds.max(1) as u64),
-        child.wait(),
-    )
-    .await
-    {
+    let wait_result = tokio::select! {
+        _ = wait_for_cancellation(cancellation) => {
+            terminate_child_process(&mut child).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(AppError::BackupCancelled);
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(timeout_seconds.max(1) as u64),
+            child.wait(),
+        ) => result,
+    };
+    let status = match wait_result {
         Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
         Err(_) => {
             terminate_child_process(&mut child).await;
@@ -921,16 +1187,18 @@ async fn run_command_output(
         } else {
             stderr
         };
-        return Err(AppError::Internal(anyhow::anyhow!(message)));
+        return Err(AppError::BackupClient(sanitize_backup_client_error(
+            &message,
+        )));
     }
 
     Ok(stdout)
 }
 
 fn postgres_major_from_server_version_num(version_num: &str) -> AppResult<String> {
-    let value = version_num.parse::<u32>().map_err(|_| {
-        AppError::Internal(anyhow::anyhow!("failed to parse PostgreSQL server version"))
-    })?;
+    let value = version_num
+        .parse::<u32>()
+        .map_err(|_| AppError::BackupClient("failed to parse PostgreSQL server version".into()))?;
     let major = value / 10000;
     if matches!(major, 14..=18) {
         Ok(major.to_string())
@@ -959,34 +1227,46 @@ fn postgres_major_from_pg_dump_version(output: &str) -> AppResult<String> {
         }
     }
 
-    Err(AppError::Internal(anyhow::anyhow!(
-        "failed to parse pg_dump version"
-    )))
+    Err(AppError::BackupClient(
+        "failed to parse pg_dump version".into(),
+    ))
 }
 
 async fn run_command(
     command_name: &str,
     mut command: Command,
     timeout_seconds: i32,
+    max_output_bytes: Option<u64>,
+    cancellation: &CancellationToken,
 ) -> AppResult<()> {
-    configure_child_process(&mut command);
+    configure_child_process(&mut command, max_output_bytes);
     let mut child = command
         .spawn()
         .map_err(|err| command_spawn_error(command_name, err))?;
     let stderr = child.stderr.take();
     let mut stderr_task = tokio::spawn(read_stderr(stderr));
 
-    let status =
-        match tokio::time::timeout(Duration::from_secs(timeout_seconds as u64), child.wait()).await
-        {
-            Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
-            Err(_) => {
-                terminate_child_process(&mut child).await;
-                stderr_task.abort();
-                let _ = stderr_task.await;
-                return Err(AppError::BackupTimeout);
-            }
-        };
+    let wait_result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            terminate_child_process(&mut child).await;
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            return Err(AppError::BackupCancelled);
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(timeout_seconds.max(1) as u64),
+            child.wait(),
+        ) => result,
+    };
+    let status = match wait_result {
+        Ok(result) => result.map_err(|err| AppError::Internal(err.into()))?,
+        Err(_) => {
+            terminate_child_process(&mut child).await;
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            return Err(AppError::BackupTimeout);
+        }
+    };
 
     let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
         Ok(result) => result.unwrap_or_default(),
@@ -1000,19 +1280,39 @@ async fn run_command(
             String::new()
         }
     };
+    #[cfg(unix)]
+    if max_output_bytes.is_some() {
+        use std::os::unix::process::ExitStatusExt;
+
+        if status.signal() == Some(libc::SIGXFSZ) {
+            return Err(backup_size_limit_error(
+                max_output_bytes.unwrap_or_default(),
+            ));
+        }
+    }
     if !status.success() {
         let message = if stderr.trim().is_empty() {
             format!("dump command exited with status {status}")
         } else {
             stderr
         };
-        return Err(AppError::Internal(anyhow::anyhow!(message)));
+        return Err(AppError::BackupClient(sanitize_backup_client_error(
+            &message,
+        )));
     }
 
     Ok(())
 }
 
-fn configure_child_process(command: &mut Command) {
+async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn configure_child_process(command: &mut Command, max_output_bytes: Option<u64>) {
+    restrict_child_environment(command);
     command.kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
@@ -1023,6 +1323,15 @@ fn configure_child_process(command: &mut Command) {
         let parent_pid = unsafe { libc::getpid() };
         unsafe {
             command.as_std_mut().pre_exec(move || {
+                if let Some(max_output_bytes) = max_output_bytes {
+                    let limit = libc::rlimit {
+                        rlim_cur: max_output_bytes as libc::rlim_t,
+                        rlim_max: max_output_bytes as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -1036,13 +1345,76 @@ fn configure_child_process(command: &mut Command) {
     }
 }
 
+fn backup_size_limit_error(max_output_bytes: u64) -> AppError {
+    AppError::Conflict(format!(
+        "backup exceeded the configured output limit of {max_output_bytes} bytes"
+    ))
+}
+
+fn restrict_child_environment(command: &mut Command) {
+    // Preserve only values deliberately set on this command (for example PGPASSWORD), then clear
+    // the inherited backend environment so JWT, encryption, admin, SMTP, and config-database
+    // credentials are never exposed to dump-client processes.
+    let explicit_environment = command
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    for name in [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.env("HOME", "/nonexistent").env("TMPDIR", "/tmp");
+    for (key, value) in explicit_environment {
+        match value {
+            Some(value) => {
+                command.env(key, value);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+}
+
 fn command_spawn_error(command_name: &str, err: io::Error) -> AppError {
     if err.kind() == io::ErrorKind::NotFound {
-        AppError::Internal(anyhow::anyhow!(
+        AppError::BackupClient(format!(
             "missing required dump command `{command_name}` in PATH"
         ))
     } else {
-        AppError::Internal(anyhow::anyhow!("failed to spawn `{command_name}`: {err}"))
+        AppError::BackupClient(format!("failed to spawn `{command_name}`: {err}"))
+    }
+}
+
+fn sanitize_backup_client_error(message: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 2_000;
+
+    let sanitized = message
+        .trim()
+        .chars()
+        .take(MAX_ERROR_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "backup client exited unsuccessfully".into()
+    } else {
+        sanitized
     }
 }
 
@@ -1146,7 +1518,11 @@ async fn mark_success_with_retry(
             }
         }
     }
-    Err(last_error.expect("mark_success retry loop must record an error"))
+    Err(last_error.unwrap_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "mark_success retry loop ended without a result"
+        ))
+    }))
 }
 
 async fn mark_failed(
@@ -1510,12 +1886,41 @@ struct DumpTarget {
     username: String,
     password: Option<String>,
     database: String,
+    connection_url: String,
+    mysql_tls: MysqlTlsOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MysqlTlsMode {
+    Disabled,
+    Required,
+    VerifyIdentity,
+}
+
+#[derive(Debug, Default)]
+struct MysqlTlsOptions {
+    mode: Option<MysqlTlsMode>,
+    ca: Option<String>,
+    capath: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+    tls_version: Option<String>,
 }
 
 impl DumpTarget {
     fn parse(input: &str) -> AppResult<Self> {
+        if input.len() > MAX_DATABASE_URL_BYTES {
+            return Err(AppError::Validation(format!(
+                "db_url must be at most {MAX_DATABASE_URL_BYTES} bytes"
+            )));
+        }
         let url = url::Url::parse(input)
             .map_err(|_| AppError::Validation("db_url must be a valid URL".into()))?;
+        if url.fragment().is_some() {
+            return Err(AppError::Validation(
+                "db_url fragments are not supported".into(),
+            ));
+        }
         let host = url
             .host_str()
             .ok_or_else(|| AppError::Validation("db_url host is required".into()))?
@@ -1542,6 +1947,40 @@ impl DumpTarget {
             _ => return Err(AppError::Validation("unsupported db_url scheme".into())),
         };
 
+        let mysql_tls = if url.scheme() == "mysql" {
+            parse_mysql_tls_options(&url)?
+        } else {
+            MysqlTlsOptions::default()
+        };
+        if matches!(url.scheme(), "postgres" | "postgresql") {
+            let mut seen_parameters = HashSet::new();
+            for (key, value) in url.query_pairs() {
+                if key.chars().any(char::is_control) || value.chars().any(char::is_control) {
+                    return Err(AppError::Validation(format!(
+                        "PostgreSQL db_url query parameter `{key}` contains control characters"
+                    )));
+                }
+                let normalized_key = key.to_ascii_lowercase();
+                if !seen_parameters.insert(normalized_key.clone()) {
+                    return Err(AppError::Validation(format!(
+                        "PostgreSQL db_url contains duplicate `{key}` parameters"
+                    )));
+                }
+                if is_postgres_identity_or_credential_parameter(&key) {
+                    return Err(AppError::Validation(format!(
+                        "PostgreSQL db_url query parameter `{key}` is not allowed; put host, port, database, user, and password in the URL authority"
+                    )));
+                }
+                if is_postgres_certificate_path_parameter(&normalized_key) {
+                    validate_target_certificate_path(&key, &value)?;
+                }
+            }
+        }
+        let mut connection_url = url.clone();
+        connection_url.set_password(None).map_err(|_| {
+            AppError::Validation("db_url password could not be removed safely".into())
+        })?;
+
         let target = Self {
             scheme: url.scheme().to_string(),
             host,
@@ -1549,6 +1988,8 @@ impl DumpTarget {
             username,
             password: url.password().map(decode_url_component),
             database,
+            connection_url: connection_url.to_string(),
+            mysql_tls,
         };
         target.validate_no_newlines()?;
         Ok(target)
@@ -1588,6 +2029,148 @@ impl DumpTarget {
     }
 }
 
+fn parse_mysql_tls_options(url: &url::Url) -> AppResult<MysqlTlsOptions> {
+    let mut options = MysqlTlsOptions::default();
+    for (key, value) in url.query_pairs() {
+        if key.chars().any(char::is_control) || value.chars().any(char::is_control) {
+            return Err(AppError::Validation(format!(
+                "MySQL db_url query parameter `{key}` contains control characters"
+            )));
+        }
+        let normalized_key = key.to_ascii_lowercase().replace('_', "-");
+        match normalized_key.as_str() {
+            "ssl-mode" => {
+                if options.mode.is_some() {
+                    return Err(AppError::Validation(
+                        "MySQL db_url contains duplicate `ssl-mode` parameters".into(),
+                    ));
+                }
+                let normalized_value = value.to_ascii_lowercase().replace('_', "-");
+                options.mode = Some(match normalized_value.as_str() {
+                    "disabled" => MysqlTlsMode::Disabled,
+                    "required" => MysqlTlsMode::Required,
+                    // The bundled MariaDB client verifies both the CA and host name, so
+                    // VERIFY_CA is intentionally strengthened to identity verification.
+                    "verify-ca" | "verify-full" | "verify-identity" => MysqlTlsMode::VerifyIdentity,
+                    _ => return Err(AppError::Validation(
+                        "MySQL ssl-mode must be disabled, required, verify-ca, or verify-identity"
+                            .into(),
+                    )),
+                });
+            }
+            "ssl-ca" => set_mysql_tls_value(&mut options.ca, &key, value.into_owned())?,
+            "ssl-capath" => set_mysql_tls_value(&mut options.capath, &key, value.into_owned())?,
+            "ssl-cert" => set_mysql_tls_value(&mut options.cert, &key, value.into_owned())?,
+            "ssl-key" => set_mysql_tls_value(&mut options.key, &key, value.into_owned())?,
+            "tls-version" => {
+                set_mysql_tls_value(&mut options.tls_version, &key, value.into_owned())?
+            }
+            _ => {
+                return Err(AppError::Validation(format!(
+                    "unsupported MySQL db_url query parameter `{key}`"
+                )))
+            }
+        }
+    }
+
+    let has_tls_details = options.ca.is_some()
+        || options.capath.is_some()
+        || options.cert.is_some()
+        || options.key.is_some()
+        || options.tls_version.is_some();
+    if options.mode.is_none() && has_tls_details {
+        return Err(AppError::Validation(
+            "MySQL ssl-mode is required when TLS certificate options are present".into(),
+        ));
+    }
+    if options.mode == Some(MysqlTlsMode::Disabled) && has_tls_details {
+        return Err(AppError::Validation(
+            "MySQL TLS certificate options cannot be combined with ssl-mode=disabled".into(),
+        ));
+    }
+    if options.mode == Some(MysqlTlsMode::VerifyIdentity)
+        && options.ca.is_none()
+        && options.capath.is_none()
+    {
+        return Err(AppError::Validation(
+            "MySQL ssl-mode verification requires ssl-ca or ssl-capath".into(),
+        ));
+    }
+    if options.cert.is_some() != options.key.is_some() {
+        return Err(AppError::Validation(
+            "MySQL ssl-cert and ssl-key must be configured together".into(),
+        ));
+    }
+    for (name, value) in [
+        ("ssl-ca", options.ca.as_deref()),
+        ("ssl-capath", options.capath.as_deref()),
+        ("ssl-cert", options.cert.as_deref()),
+        ("ssl-key", options.key.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_target_certificate_path(name, value)?;
+        }
+    }
+    Ok(options)
+}
+
+fn set_mysql_tls_value(target: &mut Option<String>, key: &str, value: String) -> AppResult<()> {
+    if value.is_empty() {
+        return Err(AppError::Validation(format!(
+            "MySQL db_url query parameter `{key}` must not be empty"
+        )));
+    }
+    if target.replace(value).is_some() {
+        return Err(AppError::Validation(format!(
+            "MySQL db_url contains duplicate `{key}` parameters"
+        )));
+    }
+    Ok(())
+}
+
+fn is_postgres_identity_or_credential_parameter(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "host"
+            | "hostaddr"
+            | "port"
+            | "dbname"
+            | "database"
+            | "user"
+            | "password"
+            | "passfile"
+            | "service"
+            | "servicefile"
+            | "sslpassword"
+    )
+}
+
+fn is_postgres_certificate_path_parameter(key: &str) -> bool {
+    matches!(
+        key,
+        "sslcert" | "sslkey" | "sslrootcert" | "sslcrl" | "sslcrldir"
+    )
+}
+
+fn validate_target_certificate_path(name: &str, value: &str) -> AppResult<()> {
+    let path = Path::new(value);
+    let contains_unsafe_component = path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::CurDir | Component::Prefix(_)
+        )
+    });
+    if !path.is_absolute()
+        || contains_unsafe_component
+        || !path.starts_with(Path::new(TARGET_CERTIFICATE_DIR))
+    {
+        return Err(AppError::Validation(format!(
+            "database TLS parameter `{name}` must be an absolute, traversal-free path under {TARGET_CERTIFICATE_DIR}"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn detect_db_version(
     db_type: &str,
     db_url: &str,
@@ -1596,15 +2179,10 @@ pub async fn detect_db_version(
     let target = DumpTarget::parse(db_url)?;
     target.validate_db_type(db_type)?;
     match db_type {
-        "postgres" => detect_postgres_major_version(&target, timeout_seconds).await,
+        "postgres" => detect_postgres_major_version(&target, timeout_seconds, None).await,
         "mysql" => {
-            let version = detect_mysql_version(&target, timeout_seconds).await?;
-            let parts: Vec<&str> = version.split('.').collect();
-            if parts.len() >= 2 {
-                Ok(format!("{}.{}", parts[0], parts[1]))
-            } else {
-                Ok(version)
-            }
+            let version = detect_mysql_version(&target, timeout_seconds, None).await?;
+            mysql_major_minor(&version)
         }
         other => Err(AppError::Validation(format!("unsupported db_type {other}"))),
     }
@@ -1621,13 +2199,33 @@ fn decode_url_component(value: &str) -> String {
 
 fn mysql_option_file(target: &DumpTarget) -> AppResult<NamedTempFile> {
     let mut file = NamedTempFile::new().map_err(|err| AppError::Internal(err.into()))?;
-    let contents = format!(
-        "[client]\nhost={}\nport={}\nuser={}\npassword={}\n",
+    let mut contents = format!(
+        "[client]\nprotocol=tcp\nhost={}\nport={}\nuser={}\npassword={}\n",
         mysql_option_value(&target.host),
         target.port,
         mysql_option_value(&target.username),
         mysql_option_value(target.password.as_deref().unwrap_or_default())
     );
+    match target.mysql_tls.mode {
+        Some(MysqlTlsMode::Disabled) => contents.push_str("skip-ssl\n"),
+        Some(MysqlTlsMode::Required) => contents.push_str("ssl\n"),
+        Some(MysqlTlsMode::VerifyIdentity) => contents.push_str("ssl\nssl-verify-server-cert\n"),
+        None => {}
+    }
+    for (name, value) in [
+        ("ssl-ca", target.mysql_tls.ca.as_deref()),
+        ("ssl-capath", target.mysql_tls.capath.as_deref()),
+        ("ssl-cert", target.mysql_tls.cert.as_deref()),
+        ("ssl-key", target.mysql_tls.key.as_deref()),
+        ("tls-version", target.mysql_tls.tls_version.as_deref()),
+    ] {
+        if let Some(value) = value {
+            contents.push_str(name);
+            contents.push('=');
+            contents.push_str(&mysql_option_value(value));
+            contents.push('\n');
+        }
+    }
     std::io::Write::write_all(&mut file, contents.as_bytes())
         .map_err(|err| AppError::Internal(err.into()))?;
     Ok(file)

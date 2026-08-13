@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiClient, cronToHuman, formatBytes } from './api';
+import { ApiClient, ApiError, cronToHuman, formatBytes } from './api';
 
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
@@ -40,7 +40,25 @@ describe('ApiClient', () => {
   it('uses backend error messages when requests fail', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ error: { message: 'unauthorized' } }, { status: 401 })));
 
-    await expect(new ApiClient('bad-token').me()).rejects.toThrow('unauthorized');
+    const error = await new ApiClient('bad-token').me().catch((caught) => caught);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ message: 'unauthorized', status: 401 });
+  });
+
+  it('requests cancellation against the backup history resource', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      data: { history_id: 'run-1', cancellation_requested: true },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(new ApiClient('token-1').cancelBackup('run-1')).resolves.toEqual({
+      history_id: 'run-1',
+      cancellation_requested: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/backup-history/run-1/cancel', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token-1' },
+    });
   });
 
   it('submits downloads natively instead of buffering the backup as a Blob', async () => {

@@ -37,7 +37,16 @@ fail-closed if the lock session is lost, so crash recovery cannot mistake anothe
 in-progress backup for an abandoned run. After an unclean database/backend restart, a replacement
 may wait up to 30 seconds for the old lease to expire.
 
-The dashboard is served by Nginx on `http://localhost` by default. The backend is available inside Docker Compose as `backend:3000` and is exposed through `/api`.
+The dashboard is served by Nginx on `http://localhost` by default. Plain HTTP binds to
+`127.0.0.1` unless `HTTP_BIND_ADDRESS` is explicitly changed. The backend is available inside
+Docker Compose as `backend:3000` and is exposed through `/api`.
+
+The backend exposes unauthenticated probes for container orchestrators and external monitors:
+
+- `GET /api/health/live` confirms that the process is serving requests.
+- `GET /api/health/ready` verifies both the configuration database and a real create/write/delete
+  cycle in the backup directory. It returns HTTP `503` when either dependency is unavailable.
+- `GET /api/health` is a backwards-compatible alias for the readiness probe.
 
 Completed backup files are written inside the backend container at `/backups`. Set `BACKUP_STORAGE_PATH` in `.env` to choose where that directory is mounted on the host:
 
@@ -46,6 +55,13 @@ BACKUP_STORAGE_PATH=/mnt/storage/dumply/backups
 ```
 
 Relative paths such as `./backups` are resolved from the directory containing `docker-compose.yml`.
+Each run is capped by `MAX_BACKUP_FILE_BYTES` (100 GiB by default), and DumplySquirrel divides
+currently usable space across configured execution slots while preserving `MIN_FREE_DISK_BYTES`
+(1 GiB by default). Tune both values for the size and capacity of the production target.
+
+For production monitoring, cancellation behavior, restore drills, incident response, and the
+deployment checklist, see [docs/OPERATIONS.md](docs/OPERATIONS.md). A backup is not considered
+proven until it has been restored and checked in an isolated environment.
 
 Email notifications use the SMTP sender configured in `.env`. You can edit `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, and `SMTP_TLS` manually, or run:
 
@@ -67,6 +83,8 @@ docker compose -f docker-compose.yml -f docker-compose.tls.yml up --build
 ```
 
 The default non-TLS stack does not reserve the host's HTTPS port.
+HTTPS binds publicly by default through `HTTPS_BIND_ADDRESS=0.0.0.0`. If you also want a public
+HTTP-to-HTTPS redirect, set `HTTP_BIND_ADDRESS=0.0.0.0`; never expose the non-TLS mode publicly.
 
 The bundled Nginx rate-limits login requests by its direct client IP. If another load balancer or
 reverse proxy sits in front, configure trusted real-IP handling and login limiting at that outer
@@ -189,23 +207,37 @@ The host dev scripts stop the matching Docker dev app container first, so ports 
 - User list/create/delete for admin users.
 - Backup config list/create/update/delete/toggle with encrypted `db_url` storage and masked API output.
 - Manual trigger endpoint that starts a guarded background backup worker.
-- PostgreSQL backup via version-matched `pg_dump` using `PGPASSWORD` instead of password arguments.
-- MySQL backup via system `mysqldump` using a temporary option file instead of password arguments.
+- Asynchronous backup cancellation that terminates the dump process tree, removes partial output,
+  records a `cancelled` terminal state, and exposes progress in the Run Room.
+- PostgreSQL backup via version-matched `pg_dump` using `PGPASSWORD` instead of password arguments;
+  libpq query parameters such as `sslmode=verify-full` are preserved in a password-free
+  connection URI.
+- MySQL backup via system `mysqldump` using a private temporary option file instead of password
+  arguments. `ssl-mode`, certificate paths, and TLS versions from the URL are validated and
+  translated to the bundled MariaDB-compatible client; dumps use `--single-transaction --quick`.
+- Target-database certificate paths are restricted to the dedicated read-only
+  `/etc/dumply-certs` mount configured by `DB_CERT_STORAGE_PATH`; dump subprocesses inherit only
+  an allowlisted environment and the credential for their own target.
 - Backup timeout handling, private atomic output files, restart recovery, and startup/hourly
   retention sweeps. Retention re-reads and locks the current policy, then queues file removal in
   the same durable cleanup outbox used by config deletion.
 - Cron scheduler using 6-field schedules (`sec min hour day month weekday`) for enabled configs.
-- Backup download streaming with an authenticated availability preflight and canonical
-  `BACKUP_DIR` path checks.
+- Backup download streaming with an authenticated availability preflight and atomic, no-symlink
+  opening of direct regular files under `BACKUP_DIR`.
 - Config deletion serializes against triggers, commits a durable file-deletion intent atomically,
   and retries managed-file cleanup without risking a database rollback that points at a lost file.
-- Dashboard stats endpoint.
-- React dashboard for login, stats, backup config CRUD, manual trigger, history download, and user management.
+- Readiness and liveness endpoints, with Docker health gating before Nginx starts.
+- Dashboard stats for backup coverage, active runs, last success, outcomes, storage, and cleanup
+  backlog; config rows also expose their latest run and last successful run.
+- React dashboard for login, operational stats, backup config CRUD, manual trigger/cancel, Run Room
+  events, history download, and user management.
 - Nginx reverse proxy serving the frontend and proxying `/api` to the backend.
+- Production Compose hardening with read-only backend/Nginx filesystems, bounded PID counts,
+  no-new-privileges, and only the capabilities Nginx needs to start and drop privileges.
 - Optional TLS mode controlled by `ENABLE_TLS`.
 - Backend graceful shutdown and configurable CORS origin.
 
 ## Pending
 
 - Automated integration tests against live PostgreSQL/MySQL targets.
-- Backup cancellation endpoint.
+- Automated restore verification and off-host storage replication.

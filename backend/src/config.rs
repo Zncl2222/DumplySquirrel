@@ -2,6 +2,12 @@ use std::{env, net::SocketAddr, path::PathBuf};
 
 use percent_encoding::percent_decode_str;
 
+const MAX_SAFE_CONCURRENT_BACKUPS: usize = 32;
+const MIN_SAFE_BACKUP_FILE_BYTES: u64 = 1024 * 1024;
+const MIN_SAFE_FREE_DISK_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_BACKUP_FILE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub database_url: String,
@@ -15,6 +21,8 @@ pub struct AppConfig {
     pub reset_admin_password_on_start: bool,
     pub jwt_ttl_seconds: i64,
     pub max_concurrent_backups: usize,
+    pub max_backup_file_bytes: u64,
+    pub min_free_disk_bytes: u64,
     pub cors_allowed_origin: Option<String>,
     pub smtp: Option<SmtpConfig>,
 }
@@ -44,9 +52,8 @@ impl AppConfig {
         let previous_database_encryption_key = optional_env("DATABASE_ENCRYPTION_KEY_PREVIOUS");
         let backup_dir =
             PathBuf::from(env::var("BACKUP_DIR").unwrap_or_else(|_| "./backups".into()));
-        let bind_addr = env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:3000".into())
-            .parse()?;
+        let bind_addr_env = env::var("BIND_ADDR").ok();
+        let bind_addr = parse_bind_addr(bind_addr_env.as_deref())?;
         let admin_username = validate_username(
             "ADMIN_USERNAME",
             &env::var("ADMIN_USERNAME").unwrap_or_else(|_| "admin".into()),
@@ -58,6 +65,12 @@ impl AppConfig {
             .parse()?;
         let max_concurrent_backups = env::var("MAX_CONCURRENT_BACKUPS")
             .unwrap_or_else(|_| "2".into())
+            .parse()?;
+        let max_backup_file_bytes = env::var("MAX_BACKUP_FILE_BYTES")
+            .unwrap_or_else(|_| DEFAULT_MAX_BACKUP_FILE_BYTES.to_string())
+            .parse()?;
+        let min_free_disk_bytes = env::var("MIN_FREE_DISK_BYTES")
+            .unwrap_or_else(|_| DEFAULT_MIN_FREE_DISK_BYTES.to_string())
             .parse()?;
         let cors_allowed_origin = env::var("CORS_ALLOWED_ORIGIN")
             .ok()
@@ -87,9 +100,8 @@ impl AppConfig {
         if jwt_ttl_seconds < 60 {
             anyhow::bail!("JWT_TTL_SECONDS must be at least 60");
         }
-        if max_concurrent_backups == 0 {
-            anyhow::bail!("MAX_CONCURRENT_BACKUPS must be greater than 0");
-        }
+        validate_max_concurrent_backups(max_concurrent_backups)?;
+        validate_backup_storage_limits(max_backup_file_bytes, min_free_disk_bytes)?;
 
         Ok(Self {
             database_url,
@@ -103,6 +115,8 @@ impl AppConfig {
             reset_admin_password_on_start,
             jwt_ttl_seconds,
             max_concurrent_backups,
+            max_backup_file_bytes,
+            min_free_disk_bytes,
             cors_allowed_origin,
             smtp,
         })
@@ -172,6 +186,12 @@ fn bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
+fn parse_bind_addr(value: Option<&str>) -> anyhow::Result<SocketAddr> {
+    // Standalone runs must not become remotely reachable by accident. Compose
+    // explicitly opts into 0.0.0.0 on its private container network.
+    Ok(value.unwrap_or("127.0.0.1:3000").parse()?)
+}
+
 fn validate_secret(
     name: &str,
     value: &str,
@@ -221,6 +241,31 @@ fn validate_username(name: &str, value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
+fn validate_max_concurrent_backups(value: usize) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("MAX_CONCURRENT_BACKUPS must be greater than 0");
+    }
+    if value > MAX_SAFE_CONCURRENT_BACKUPS {
+        anyhow::bail!(
+            "MAX_CONCURRENT_BACKUPS must not exceed {MAX_SAFE_CONCURRENT_BACKUPS}; run additional isolated workers instead of exhausting one host"
+        );
+    }
+    Ok(())
+}
+
+fn validate_backup_storage_limits(max_file_bytes: u64, min_free_bytes: u64) -> anyhow::Result<()> {
+    if max_file_bytes < MIN_SAFE_BACKUP_FILE_BYTES {
+        anyhow::bail!("MAX_BACKUP_FILE_BYTES must be at least {MIN_SAFE_BACKUP_FILE_BYTES} bytes");
+    }
+    if max_file_bytes > i64::MAX as u64 {
+        anyhow::bail!("MAX_BACKUP_FILE_BYTES must not exceed {} bytes", i64::MAX);
+    }
+    if min_free_bytes < MIN_SAFE_FREE_DISK_BYTES {
+        anyhow::bail!("MIN_FREE_DISK_BYTES must be at least {MIN_SAFE_FREE_DISK_BYTES} bytes");
+    }
+    Ok(())
+}
+
 fn is_known_placeholder(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -268,5 +313,28 @@ mod tests {
             validate_username("ADMIN_USERNAME", " admin ").unwrap(),
             "admin"
         );
+        assert!(validate_max_concurrent_backups(1).is_ok());
+        assert!(validate_max_concurrent_backups(MAX_SAFE_CONCURRENT_BACKUPS).is_ok());
+        assert!(validate_max_concurrent_backups(0).is_err());
+        assert!(validate_max_concurrent_backups(MAX_SAFE_CONCURRENT_BACKUPS + 1).is_err());
+        assert!(validate_backup_storage_limits(
+            DEFAULT_MAX_BACKUP_FILE_BYTES,
+            DEFAULT_MIN_FREE_DISK_BYTES
+        )
+        .is_ok());
+        assert!(validate_backup_storage_limits(MIN_SAFE_BACKUP_FILE_BYTES - 1, 64 << 20).is_err());
+        assert!(validate_backup_storage_limits(u64::MAX, DEFAULT_MIN_FREE_DISK_BYTES).is_err());
+        assert!(validate_backup_storage_limits(1 << 20, MIN_SAFE_FREE_DISK_BYTES - 1).is_err());
+    }
+
+    #[test]
+    fn standalone_backend_defaults_to_loopback() {
+        let default = parse_bind_addr(None).unwrap();
+        assert!(default.ip().is_loopback());
+        assert_eq!(default.port(), 3000);
+
+        let explicit = parse_bind_addr(Some("0.0.0.0:8000")).unwrap();
+        assert!(explicit.ip().is_unspecified());
+        assert_eq!(explicit.port(), 8000);
     }
 }

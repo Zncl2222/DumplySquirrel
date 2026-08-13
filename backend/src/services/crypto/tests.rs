@@ -12,10 +12,14 @@ fn encrypt_decrypt_roundtrip() {
 
 #[test]
 fn mask_database_url_hides_password() {
-    let masked = mask_database_url("postgres://user:secret@example.com:5432/app");
+    let masked = mask_database_url(
+        "postgres://user:secret@example.com:5432/app?sslmode=require&access_token=query-secret",
+    );
 
     assert!(masked.contains("user:****@"));
     assert!(!masked.contains("secret"));
+    assert!(masked.contains("sslmode=require"));
+    assert!(!masked.contains("query-secret"));
 }
 
 #[test]

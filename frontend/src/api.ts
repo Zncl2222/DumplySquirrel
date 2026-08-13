@@ -1,5 +1,12 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api';
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 export type User = {
   id: string;
   username: string;
@@ -23,6 +30,9 @@ export type BackupConfig = {
   email_notify_on: 'never' | 'failure' | 'always';
   created_at: string;
   updated_at: string;
+  last_run_status: string | null;
+  last_run_at: string | null;
+  last_success_at: string | null;
 };
 
 export type BackupHistory = {
@@ -61,11 +71,15 @@ export type RunningBackup = {
 
 export type DashboardStats = {
   total_configs: number;
+  protected_configs: number;
   total_backups: number;
   success_count: number;
   failed_count: number;
+  cancelled_count: number;
+  running_count: number;
   storage_bytes: number;
   pending_file_deletions: number;
+  last_success_at: string | null;
 };
 
 type ApiEnvelope<T> = { data: T };
@@ -155,6 +169,13 @@ export class ApiClient {
     return this.request<BackupHistory>(`/backup-configs/${id}/trigger`, { method: 'POST' });
   }
 
+  cancelBackup(historyId: string) {
+    return this.request<{ history_id: string; cancellation_requested: boolean }>(
+      `/backup-history/${historyId}/cancel`,
+      { method: 'POST' },
+    );
+  }
+
   history(query: HistoryQuery = {}) {
     const search = new URLSearchParams();
     Object.entries(query).forEach(([key, value]) => {
@@ -209,7 +230,7 @@ export class ApiClient {
       headers: this.headers(false),
     });
     if (!preflight.ok) {
-      throw new Error(await responseError(preflight));
+      throw await responseError(preflight);
     }
 
     // A native form download lets the browser stream the attachment directly to disk. Fetching
@@ -253,7 +274,7 @@ export class ApiClient {
       },
     });
     if (!response.ok) {
-      throw new Error(await responseError(response));
+      throw await responseError(response);
     }
     return (await response.json()) as T;
   }
@@ -273,9 +294,13 @@ export class ApiClient {
 async function responseError(response: Response) {
   try {
     const body = await response.json();
-    return body.error?.message ?? `Request failed with ${response.status}`;
+    return new ApiError(
+      body.error?.message ?? `Request failed with ${response.status}`,
+      response.status,
+      body.error?.code,
+    );
   } catch {
-    return `Request failed with ${response.status}`;
+    return new ApiError(`Request failed with ${response.status}`, response.status);
   }
 }
 

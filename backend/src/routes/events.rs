@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
@@ -75,12 +77,14 @@ async fn list_running(
         FROM backup_history h
         JOIN backup_configs c ON c.id = h.config_id
         WHERE h.status = 'running'
-        ORDER BY h.started_at DESC
+        ORDER BY h.started_at DESC, h.id DESC
         "#,
     )
     .fetch_all(&state.db)
     .await?;
 
+    let history_ids = rows.iter().map(|row| row.history_id).collect::<Vec<_>>();
+    let mut events_by_history = events_for_histories(&state, &history_ids).await?;
     let mut runs = Vec::with_capacity(rows.len());
     for row in rows {
         let history = BackupHistory {
@@ -102,7 +106,7 @@ async fn list_running(
             db_type: row.db_type,
             db_version: row.db_version,
         };
-        let events = events_for_history(&state, history.id, None).await?;
+        let events = events_by_history.remove(&history.id).unwrap_or_default();
         runs.push(RunningBackup {
             history,
             config,
@@ -111,6 +115,32 @@ async fn list_running(
     }
 
     Ok(Json(json!({ "data": runs })))
+}
+
+async fn events_for_histories(
+    state: &AppState,
+    history_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<BackupEvent>>> {
+    if history_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let events = sqlx::query_as::<_, BackupEvent>(
+        r#"
+        SELECT id, history_id, sequence, stage, level, message, created_at
+        FROM backup_events
+        WHERE history_id = ANY($1)
+        ORDER BY history_id, sequence ASC
+        "#,
+    )
+    .bind(history_ids)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut grouped = HashMap::<Uuid, Vec<BackupEvent>>::new();
+    for event in events {
+        grouped.entry(event.history_id).or_default().push(event);
+    }
+    Ok(grouped)
 }
 
 async fn list_events(
