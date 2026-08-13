@@ -52,9 +52,8 @@ impl AppConfig {
         let previous_database_encryption_key = optional_env("DATABASE_ENCRYPTION_KEY_PREVIOUS");
         let backup_dir =
             PathBuf::from(env::var("BACKUP_DIR").unwrap_or_else(|_| "./backups".into()));
-        let bind_addr = env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:3000".into())
-            .parse()?;
+        let bind_addr_env = env::var("BIND_ADDR").ok();
+        let bind_addr = parse_bind_addr(bind_addr_env.as_deref())?;
         let admin_username = validate_username(
             "ADMIN_USERNAME",
             &env::var("ADMIN_USERNAME").unwrap_or_else(|_| "admin".into()),
@@ -185,6 +184,12 @@ fn bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => anyhow::bail!("environment variable {name} must be true or false"),
     }
+}
+
+fn parse_bind_addr(value: Option<&str>) -> anyhow::Result<SocketAddr> {
+    // Standalone runs must not become remotely reachable by accident. Compose
+    // explicitly opts into 0.0.0.0 on its private container network.
+    Ok(value.unwrap_or("127.0.0.1:3000").parse()?)
 }
 
 fn validate_secret(
@@ -320,5 +325,16 @@ mod tests {
         assert!(validate_backup_storage_limits(MIN_SAFE_BACKUP_FILE_BYTES - 1, 64 << 20).is_err());
         assert!(validate_backup_storage_limits(u64::MAX, DEFAULT_MIN_FREE_DISK_BYTES).is_err());
         assert!(validate_backup_storage_limits(1 << 20, MIN_SAFE_FREE_DISK_BYTES - 1).is_err());
+    }
+
+    #[test]
+    fn standalone_backend_defaults_to_loopback() {
+        let default = parse_bind_addr(None).unwrap();
+        assert!(default.ip().is_loopback());
+        assert_eq!(default.port(), 3000);
+
+        let explicit = parse_bind_addr(Some("0.0.0.0:8000")).unwrap();
+        assert!(explicit.ip().is_unspecified());
+        assert_eq!(explicit.port(), 8000);
     }
 }
