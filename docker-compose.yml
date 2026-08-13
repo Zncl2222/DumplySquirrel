@@ -2,6 +2,9 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     environment:
       POSTGRES_DB: dumply_squirrel
       POSTGRES_USER: dumply
@@ -63,8 +66,23 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - NET_BIND_SERVICE
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
+    pids_limit: 128
+    tmpfs:
+      - /etc/nginx/conf.d:rw,noexec,nosuid,nodev,size=1m
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m
+      - /var/run:rw,noexec,nosuid,nodev,size=1m
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777,size=16m
     depends_on:
       backend:
         condition: service_healthy

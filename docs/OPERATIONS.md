@@ -27,6 +27,8 @@ backup mount, monitoring, and restore drills are operated.
 - Configure SMTP and test at least one successful and one failed notification path when email is
   part of the incident workflow.
 - Send container logs to persistent log storage and configure the health/backup alerts below.
+- Preserve the production Compose security settings when adapting deployment manifests: read-only
+  backend/Nginx roots, bounded PID counts, no-new-privileges, and restricted capabilities.
 - Complete a restore drill before relying on the system, and repeat it on a fixed schedule.
 
 ## Health and monitoring

@@ -167,6 +167,12 @@ jobs:
           }
           trap cleanup EXIT
           docker compose up --detach --build --wait --wait-timeout 120
+          backend_id="$(docker compose ps --quiet backend)"
+          frontend_id="$(docker compose ps --quiet frontend)"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$backend_id")" = true
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$frontend_id")" = true
+          docker inspect --format '{{json .HostConfig.CapDrop}}' "$backend_id" | grep --quiet 'ALL'
+          docker inspect --format '{{json .HostConfig.CapDrop}}' "$frontend_id" | grep --quiet 'ALL'
           response_headers="${RUNNER_TEMP}/dumply-response-headers"
           curl --fail --silent --show-error --dump-header "$response_headers" \
             http://127.0.0.1:18080/api/health/ready >/dev/null

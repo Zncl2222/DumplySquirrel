@@ -232,6 +232,8 @@ The host dev scripts stop the matching Docker dev app container first, so ports 
 - React dashboard for login, operational stats, backup config CRUD, manual trigger/cancel, Run Room
   events, history download, and user management.
 - Nginx reverse proxy serving the frontend and proxying `/api` to the backend.
+- Production Compose hardening with read-only backend/Nginx filesystems, bounded PID counts,
+  no-new-privileges, and only the capabilities Nginx needs to start and drop privileges.
 - Optional TLS mode controlled by `ENABLE_TLS`.
 - Backend graceful shutdown and configurable CORS origin.
 
